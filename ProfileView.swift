@@ -8,12 +8,18 @@
 
 import SwiftUI
 import MusicKit
+import SwiftData
+import UIKit
 
 struct ProfileView: View {
 
     @EnvironmentObject private var appState: AppStateManager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.openURL) private var openURL
 
     @State private var showDisconnectAlert = false
+    @State private var showConnectionError = false
+    @State private var isConnectingAppleMusic = false
 
     var body: some View {
         List {
@@ -43,13 +49,30 @@ struct ProfileView: View {
         }
         .navigationTitle("Profile")
         .navigationBarTitleDisplayMode(.large)
-        .alert("Disconnect Apple Music?", isPresented: $showDisconnectAlert) {
-            Button("Disconnect", role: .destructive) {
+        .confirmationDialog(
+            "Disconnect Apple Music from Retune?",
+            isPresented: $showDisconnectAlert,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect & Keep Sessions", role: .destructive) {
                 Task { await appState.disconnectAppleMusic() }
+            }
+            Button("Disconnect & Delete Sessions", role: .destructive) {
+                deleteAppleMusicSessions()
+                Task { await appState.disconnectAppleMusic() }
+            }
+            Button("Open iOS Settings") {
+                openSystemSettings()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("You'll be taken back to the sign-in screen. Your session history won't be affected.")
+            Text("Retune can disconnect locally, but only iOS Settings can revoke the system Music permission.")
+        }
+        .alert("Apple Music Access Needed", isPresented: $showConnectionError) {
+            Button("Open iOS Settings") { openSystemSettings() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Allow Retune to access Media & Apple Music, then try connecting again.")
         }
     }
 
@@ -57,31 +80,36 @@ struct ProfileView: View {
 
     @ViewBuilder
     private var connectedServiceCard: some View {
-        switch appState.connectedService {
-        case .appleMusic, .both:
-            HStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(.systemGray5))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "applelogo")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.primary)
+        let isConnected = appState.connectedService == .appleMusic
+
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(.systemGray5))
+                    .frame(width: 44, height: 44)
+                Image(systemName: "applelogo")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Apple Music")
+                    .font(.body.weight(.medium))
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(isConnected ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text(isConnected ? "Connected" : "Not connected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+            }
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Apple Music")
-                        .font(.body.weight(.medium))
-                    HStack(spacing: 5) {
-                        Circle().fill(Color.green).frame(width: 7, height: 7)
-                        Text("Connected")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            Spacer()
 
-                Spacer()
-
+            if isConnectingAppleMusic {
+                ProgressView()
+            } else if isConnected {
                 Button(role: .destructive) {
                     showDisconnectAlert = true
                 } label: {
@@ -90,43 +118,16 @@ struct ProfileView: View {
                         .foregroundStyle(.red)
                 }
                 .buttonStyle(.plain)
-            }
-            .padding(.vertical, 4)
-
-        case .spotify:
-            // Shouldn't normally be reachable since Spotify tracks are blocked,
-            // but handle gracefully if someone was previously connected
-            HStack(spacing: 14) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(red: 0.11, green: 0.73, blue: 0.33))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "music.note")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.white)
+            } else {
+                Button("Connect") {
+                    connectAppleMusic()
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Spotify")
-                        .font(.body.weight(.medium))
-                    HStack(spacing: 5) {
-                        Circle().fill(Color.orange).frame(width: 7, height: 7)
-                        Text("Limited access — coming soon")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-            }
-            .padding(.vertical, 4)
-
-        case .none:
-            HStack {
-                Image(systemName: "exclamationmark.circle")
-                    .foregroundStyle(.orange)
-                Text("No service connected")
-                    .foregroundStyle(.secondary)
+                .font(.subheadline.weight(.medium))
+                .buttonStyle(.plain)
+                .foregroundStyle(.blue)
             }
         }
+        .padding(.vertical, 4)
     }
 
     // MARK: - Spotify coming soon row
@@ -173,5 +174,30 @@ struct ProfileView: View {
 
     private var buildNumber: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+    }
+
+    private func deleteAppleMusicSessions() {
+        let descriptor = FetchDescriptor<SessionRecord>(
+            predicate: #Predicate { $0.platform == "appleMusic" }
+        )
+        guard let sessions = try? modelContext.fetch(descriptor) else { return }
+        sessions.forEach { modelContext.delete($0) }
+    }
+
+    private func openSystemSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        openURL(url)
+    }
+
+    private func connectAppleMusic() {
+        guard !isConnectingAppleMusic else { return }
+        isConnectingAppleMusic = true
+        Task {
+            let connected = await appState.connectAppleMusic()
+            isConnectingAppleMusic = false
+            if !connected {
+                showConnectionError = true
+            }
+        }
     }
 }

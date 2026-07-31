@@ -46,15 +46,12 @@ final class AppStateManager: ObservableObject {
     // MARK: - Private
 
     private let onboardingKey = "hasCompletedOnboarding"
-    private var cancellables  = Set<AnyCancellable>()
+    private let appleMusicDisconnectedKey = "appleMusicDisconnectedFromRetune"
 
     private init() {
-        SpotifyAuthManager.shared.$isAuthenticated
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                Task { await self?.refreshServiceState() }
-            }
-            .store(in: &cancellables)
+        // Spotify is not a supported service yet. Remove credentials left by
+        // earlier development builds so they cannot hijack app routing.
+        SpotifyAuthManager.shared.clearLegacyCredentials()
     }
 
     // MARK: - Boot sequence (called from LaunchScreenView)
@@ -63,29 +60,16 @@ final class AppStateManager: ObservableObject {
         try? await Task.sleep(for: .milliseconds(800))
         await refreshServiceState()
 
-        if connectedService == .none && !hasCompletedOnboarding {
-            phase = .onboarding
-        } else {
-            phase = .home
-        }
+        phase = connectedService == .appleMusic ? .home : .onboarding
     }
 
     // MARK: - Service detection
 
     func refreshServiceState() async {
-        let appleMusicAuthorized = MusicAuthorization.currentStatus == .authorized
-        let spotifyAuthenticated = SpotifyAuthManager.shared.isAuthenticated
-
-        switch (appleMusicAuthorized, spotifyAuthenticated) {
-        case (true,  true):  connectedService = .both
-        case (true,  false): connectedService = .appleMusic
-        case (false, true):  connectedService = .spotify
-        case (false, false): connectedService = .none
-        }
-
-        // When dropping from both → single, snap activeService to whatever remains
-        if connectedService == .appleMusic { activeService = .appleMusic }
-        if connectedService == .spotify    { activeService = .spotify }
+        let appleMusicAuthorized =
+            MusicAuthorization.currentStatus == .authorized && !isAppleMusicDisconnected
+        connectedService = appleMusicAuthorized ? .appleMusic : .none
+        activeService = .appleMusic
     }
 
     // MARK: - Onboarding
@@ -94,7 +78,15 @@ final class AppStateManager: ObservableObject {
         UserDefaults.standard.bool(forKey: onboardingKey)
     }
 
+    private var isAppleMusicDisconnected: Bool {
+        UserDefaults.standard.bool(forKey: appleMusicDisconnectedKey)
+    }
+
     func completeOnboarding() {
+        guard connectedService == .appleMusic else {
+            phase = .onboarding
+            return
+        }
         UserDefaults.standard.set(true, forKey: onboardingKey)
         phase = .home
     }
@@ -104,18 +96,21 @@ final class AppStateManager: ObservableObject {
     @discardableResult
     func connectAppleMusic() async -> Bool {
         let status = await MusicAuthorization.request()
+        if status == .authorized {
+            UserDefaults.standard.set(false, forKey: appleMusicDisconnectedKey)
+        }
         await refreshServiceState()
         return status == .authorized
     }
 
     func disconnectSpotify() async {
-        SpotifyAuthManager.shared.logout()
+        SpotifyAuthManager.shared.clearLegacyCredentials()
         await refreshServiceState()
-        if connectedService == .none { phase = .onboarding }
     }
 
     func disconnectAppleMusic() async {
+        UserDefaults.standard.set(true, forKey: appleMusicDisconnectedKey)
         await refreshServiceState()
-        if connectedService == .none { phase = .onboarding }
+        phase = .onboarding
     }
 }

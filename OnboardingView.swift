@@ -10,10 +10,12 @@
 
 import SwiftUI
 import MusicKit
+import UIKit
 
 struct OnboardingView: View {
 
     @EnvironmentObject private var appState: AppStateManager
+    @Environment(\.openURL) private var openURL
 
     @State private var page: Int = 0
     @State private var selectedService: MusicPlatform? = nil
@@ -174,18 +176,20 @@ struct OnboardingView: View {
             .padding(.horizontal, 24)
 
             if let error = appleMusicError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
+                VStack(spacing: 8) {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                    Button("Open iOS Settings") {
+                        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                        openURL(url)
+                    }
+                    .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 32)
             }
 
-            Button { appState.completeOnboarding() } label: {
-                Text("Skip for now")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
         }
     }
 

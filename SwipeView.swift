@@ -26,10 +26,13 @@ struct RetuneSwipeView: View {
     @State private var keptSongs:      [Song] = []
     @State private var removedSongs:   [Song] = []
     @State private var goToSave = false
+    @State private var showDiscardConfirmation = false
+    @State private var sessionWasSaved = false
     @State private var screenTint: Color = .black
 
     // SwiftData
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
     @State private var sessionRecord: SessionRecord? = nil
 
     init(songs: [Song], playlistID: String, playlistName: String, orderMode: String) {
@@ -74,9 +77,34 @@ struct RetuneSwipeView: View {
         }
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(isPresented: $goToSave) {
-            SaveRetunedPlaylistView(keptSongs: keptSongs, removedSongs: removedSongs, platform: playlistID.hasPrefix("spotify:") ? "spotify" : "appleMusic")
+            SaveRetunedPlaylistView(
+                keptSongs: keptSongs,
+                removedSongs: removedSongs,
+                platform: playlistID.hasPrefix("spotify:") ? "spotify" : "appleMusic",
+                originalSongs: allSongs,
+                onSaveSucceeded: completeSavedSession,
+                onReviewChanged: applyReviewedSongs
+            )
         }
         .onAppear { restoreOrCreateSession() }
+        .onChange(of: goToSave) { _, isShowingSave in
+            if !isShowingSave && sessionWasSaved {
+                dismiss()
+            }
+        }
+        .confirmationDialog(
+            "Discard this completed session?",
+            isPresented: $showDiscardConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Discard Session", role: .destructive) {
+                deleteSession()
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your swipe decisions will be permanently removed.")
+        }
     }
 
     // MARK: - Progress Bar
@@ -188,7 +216,10 @@ struct RetuneSwipeView: View {
                 Button {
                     goToSave = true
                 } label: {
-                    Label("Save to Apple Music", systemImage: "music.note.plus")
+                    Label(
+                        playlistID.hasPrefix("spotify:") ? "Save to Spotify" : "Save to Apple Music",
+                        systemImage: "music.note.plus"
+                    )
                         .frame(maxWidth: .infinity)
                         .padding()
                         .background(screenTint.opacity(0.85))
@@ -197,7 +228,7 @@ struct RetuneSwipeView: View {
                 }
 
                 Button(role: .destructive) {
-                    deleteSession()
+                    showDiscardConfirmation = true
                 } label: {
                     Text("Discard Session")
                         .frame(maxWidth: .infinity)
@@ -213,7 +244,6 @@ struct RetuneSwipeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 24))
         .shadow(radius: 20)
         .padding(24)
-        .onAppear { deleteSession() }  // session complete — clean up record
     }
 
     private func statBadge(count: Int, label: String, color: Color, icon: String) -> some View {
@@ -241,6 +271,7 @@ struct RetuneSwipeView: View {
 
     /// On appear — either restore an existing session for this playlist, or create a new one.
     private func restoreOrCreateSession() {
+        guard !sessionWasSaved else { return }
         let id = playlistID
 
         // Fetch any existing record for this playlist
@@ -249,7 +280,7 @@ struct RetuneSwipeView: View {
         )
         let existing = (try? modelContext.fetch(descriptor))?.first
 
-        if let record = existing, !record.isComplete {
+        if let record = existing {
             // Restore state from the saved record
             sessionRecord = record
             remainingSongs = record.remainingSongs
@@ -264,11 +295,10 @@ struct RetuneSwipeView: View {
                     return SwipeDecision(song: song, kept: decision.kept)
                 }
         } else {
-            // Clean up any stale completed record and start fresh
-            if let old = existing { modelContext.delete(old) }
             let record = SessionRecord(
                 playlistID:   playlistID,
                 playlistName: playlistName,
+                platform:     playlistID.hasPrefix("spotify:") ? "spotify" : "appleMusic",
                 orderMode:    orderMode,
                 songs:        allSongs
             )
@@ -302,5 +332,22 @@ struct RetuneSwipeView: View {
         guard let record = sessionRecord else { return }
         modelContext.delete(record)
         sessionRecord = nil
+    }
+
+    /// Remove persisted progress only after the destination playlist fully saves.
+    private func completeSavedSession() {
+        deleteSession()
+        sessionWasSaved = true
+    }
+
+    /// Keep pre-save review edits in both the UI and the persisted completed session.
+    private func applyReviewedSongs(kept: [Song], removed: [Song]) {
+        keptSongs = kept
+        removedSongs = removed
+
+        let keptIDs = Set(kept.map { $0.id.uuidString })
+        sessionRecord?.decisions.forEach { decision in
+            decision.kept = keptIDs.contains(decision.songID)
+        }
     }
 }

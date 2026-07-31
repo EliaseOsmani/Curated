@@ -76,6 +76,14 @@ final class SpotifyAuthManager: NSObject, ObservableObject {
         isAuthenticated = false
     }
 
+    /// Removes credentials created by development builds before Spotify was
+    /// moved behind the Coming Soon state.
+    func clearLegacyCredentials() {
+        logout()
+        errorMessage = nil
+        isAuthenticating = false
+    }
+
     // MARK: - Callback
 
     private func handleCallback(url: URL?, error: Error?) async {

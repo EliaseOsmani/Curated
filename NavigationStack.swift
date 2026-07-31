@@ -64,6 +64,22 @@ enum MusicPlatform: String, CaseIterable {
     }
 }
 
+enum PlaylistSortOption: String, CaseIterable {
+    case recentlyPlayed = "Recently Played"
+    case alphabetical   = "Alphabetical"
+    case longest        = "Longest"
+    case shortest       = "Shortest"
+
+    var icon: String {
+        switch self {
+        case .recentlyPlayed: return "clock.arrow.circlepath"
+        case .alphabetical:   return "textformat.abc"
+        case .longest:        return "arrow.down.to.line"
+        case .shortest:       return "arrow.up.to.line"
+        }
+    }
+}
+
 // MARK: - Home View
 
 struct HomeView: View {
@@ -74,6 +90,8 @@ struct HomeView: View {
     @StateObject private var spotifyAuth  = SpotifyAuthManager.shared
 
     @State private var selected: PlaylistSelection?
+    @AppStorage("playlistSortOption") private var playlistSortRawValue =
+        PlaylistSortOption.recentlyPlayed.rawValue
 
     @Query private var savedSessions: [SessionRecord]
     @State private var resumeSongs:   [Song]?        = nil
@@ -189,11 +207,50 @@ struct HomeView: View {
     }
 
     private var currentPlaylists: [PlaylistSelection] {
+        let playlists: [PlaylistSelection]
         switch activePlatform {
         case .appleMusic:
-            return appleMusicVM.playlists.map { PlaylistSelection(appleMusicPlaylist: $0) }
+            playlists = appleMusicVM.playlists.map { PlaylistSelection(appleMusicPlaylist: $0) }
         case .spotify:
-            return spotifyVM.playlists.map { PlaylistSelection(spotifyPlaylist: $0) }
+            playlists = spotifyVM.playlists.map { PlaylistSelection(spotifyPlaylist: $0) }
+        }
+        return sort(playlists)
+    }
+
+    private var playlistSortOption: PlaylistSortOption {
+        PlaylistSortOption(rawValue: playlistSortRawValue) ?? .recentlyPlayed
+    }
+
+    private func sort(_ playlists: [PlaylistSelection]) -> [PlaylistSelection] {
+        playlists.sorted { lhs, rhs in
+            switch playlistSortOption {
+            case .recentlyPlayed:
+                switch (lhs.lastPlayedDate, rhs.lastPlayedDate) {
+                case let (left?, right?) where left != right:
+                    return left > right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+
+            case .alphabetical:
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+
+            case .longest:
+                if lhs.trackCount != rhs.trackCount {
+                    return lhs.trackCount > rhs.trackCount
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+
+            case .shortest:
+                if lhs.trackCount != rhs.trackCount {
+                    return lhs.trackCount < rhs.trackCount
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
         }
     }
 
@@ -216,6 +273,7 @@ struct HomeView: View {
                     Text("\(currentPlaylists.count)")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    sortMenu
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 10)
@@ -231,6 +289,25 @@ struct HomeView: View {
             .padding(.bottom, 24)
         }
         .background(Color(.systemGroupedBackground))
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort Playlists", selection: $playlistSortRawValue) {
+                ForEach(PlaylistSortOption.allCases, id: \.self) { option in
+                    Label(option.rawValue, systemImage: option.icon)
+                        .tag(option.rawValue)
+                }
+            }
+        } label: {
+            Label(playlistSortOption.rawValue, systemImage: "arrow.up.arrow.down")
+                .font(.caption.weight(.medium))
+                .labelStyle(.iconOnly)
+                .frame(width: 32, height: 32)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(Circle())
+                .accessibilityLabel("Sort playlists: \(playlistSortOption.rawValue)")
+        }
     }
 
     // MARK: - Header Banner
@@ -269,10 +346,10 @@ struct HomeView: View {
 
     @ViewBuilder
     private var resumeBanner: some View {
-        if let session = savedSessions.first(where: { !$0.isComplete }) {
+        if let session = savedSessions.sorted(by: { $0.startedAt > $1.startedAt }).first {
             Button {
                 resumeSession = session
-                resumeSongs   = session.remainingSongs
+                resumeSongs   = session.allSongs
                 showResume    = true
             } label: {
                 HStack(spacing: 12) {
@@ -280,10 +357,14 @@ struct HomeView: View {
                         .font(.title2)
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Resume Session")
+                        Text(session.isComplete ? "Save Completed Session" : "Resume Session")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
-                        Text("\(session.playlistName) · \(session.decisions.count) of \(session.allSongs.count) swiped")
+                        Text(
+                            session.isComplete
+                                ? "\(session.playlistName) · ready to save"
+                                : "\(session.playlistName) · \(session.decisions.count) of \(session.allSongs.count) swiped"
+                        )
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -364,7 +445,11 @@ struct UnifiedPlaylistRow: View {
                         .font(.body.weight(.medium))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    Text("Tap to retune")
+                    Text(
+                        selection.trackCount > 0
+                            ? "\(selection.trackCount) songs · Tap to retune"
+                            : "Tap to retune"
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -376,8 +461,22 @@ struct UnifiedPlaylistRow: View {
                     .foregroundStyle(.tertiary)
             }
             .padding(12)
-            .background(Color(.secondarySystemGroupedBackground))
+            .background {
+                LinearGradient(
+                    colors: [
+                        tintColor.opacity(0.38),
+                        tintColor.opacity(0.16),
+                        Color(.secondarySystemGroupedBackground)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
             .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(tintColor.opacity(0.25), lineWidth: 1)
+            }
         }
         .buttonStyle(.plain)
         .task { await loadArtwork() }
@@ -405,6 +504,8 @@ struct PlaylistSelection: Identifiable, Hashable {
     let name: String
     let artworkURL: URL?
     let isSpotify: Bool
+    let lastPlayedDate: Date?
+    let trackCount: Int
 
     var appleMusicPlaylist: Playlist?
     var spotifyPlaylist:    SpotifyPlaylist?
@@ -414,6 +515,8 @@ struct PlaylistSelection: Identifiable, Hashable {
         self.name               = appleMusicPlaylist.name
         self.artworkURL         = appleMusicPlaylist.artwork?.url(width: 120, height: 120)
         self.isSpotify          = false
+        self.lastPlayedDate     = appleMusicPlaylist.lastPlayedDate
+        self.trackCount         = appleMusicPlaylist.tracks?.count ?? 0
         self.appleMusicPlaylist = appleMusicPlaylist
         self.spotifyPlaylist    = nil
     }
@@ -423,6 +526,8 @@ struct PlaylistSelection: Identifiable, Hashable {
         self.name            = spotifyPlaylist.name
         self.artworkURL      = spotifyPlaylist.artworkURL
         self.isSpotify       = true
+        self.lastPlayedDate  = nil
+        self.trackCount      = 0
         self.spotifyPlaylist = spotifyPlaylist
         self.appleMusicPlaylist = nil
     }

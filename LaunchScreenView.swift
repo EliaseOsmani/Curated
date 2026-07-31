@@ -70,7 +70,7 @@ struct LaunchScreenView: View {
                     .opacity(wordmarkOpacity)
 
                 // ── Tagline ────────────────────────────────────────────────
-                Text("Curate what you love")
+                Text("Curate Your Sound")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .padding(.top, 6)

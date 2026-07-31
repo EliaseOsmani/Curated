@@ -16,6 +16,7 @@ enum SaveState: Equatable {
     case creatingPlaylist
     case addingTracks(current: Int, total: Int)
     case success(playlistName: String)
+    case partialSuccess(playlistName: String, added: Int, total: Int)
     case noSubscription
     case failed(String)
 }
@@ -28,7 +29,7 @@ final class SavePlaylistVM: ObservableObject {
 
     var isWorking: Bool {
         switch saveState {
-        case .idle, .success, .noSubscription, .failed: return false
+        case .idle, .success, .partialSuccess, .noSubscription, .failed: return false
         default: return true
         }
     }
@@ -100,10 +101,13 @@ final class SavePlaylistVM: ObservableObject {
             }
         }
 
-        if addedCount == 0 {
+        let expectedCount = keptSongs.count
+        if addedCount == expectedCount {
+            saveState = .success(playlistName: name)
+        } else if addedCount == 0 {
             saveState = .failed("Playlist was created but no songs could be added. Try again.")
         } else {
-            saveState = .success(playlistName: name)
+            saveState = .partialSuccess(playlistName: name, added: addedCount, total: expectedCount)
         }
     }
 
@@ -139,20 +143,65 @@ struct SaveRetunedPlaylistView: View {
     let keptSongs:    [Song]
     let removedSongs: [Song]
     let platform:     String
+    let onSaveSucceeded: () -> Void
+    let onReviewChanged: ([Song], [Song]) -> Void
+    let originalSongs: [Song]
 
     @StateObject private var vm = SavePlaylistVM()
     @State private var newName = ""
+    @State private var reviewedKeptSongs: [Song]
+    @State private var reviewedRemovedSongs: [Song]
     @Environment(\.dismiss) private var dismiss
+
+    init(
+        keptSongs: [Song],
+        removedSongs: [Song],
+        platform: String,
+        originalSongs: [Song]? = nil,
+        onSaveSucceeded: @escaping () -> Void = {},
+        onReviewChanged: @escaping ([Song], [Song]) -> Void = { _, _ in }
+    ) {
+        self.keptSongs = keptSongs
+        self.removedSongs = removedSongs
+        self.platform = platform
+        self.originalSongs = originalSongs ?? (keptSongs + removedSongs)
+        self.onSaveSucceeded = onSaveSucceeded
+        self.onReviewChanged = onReviewChanged
+        _reviewedKeptSongs = State(initialValue: keptSongs)
+        _reviewedRemovedSongs = State(initialValue: removedSongs)
+    }
 
     var body: some View {
         Form {
             Section("Session Summary") {
                 HStack {
-                    Label("\(keptSongs.count) kept", systemImage: "checkmark.circle.fill")
+                    Label("\(reviewedKeptSongs.count) kept", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                     Spacer()
-                    Label("\(removedSongs.count) archived", systemImage: "archivebox.fill")
+                    Label("\(reviewedRemovedSongs.count) archived", systemImage: "archivebox.fill")
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            if !isFinalState && !vm.isWorking {
+                Section {
+                    ForEach(reviewedKeptSongs) { song in
+                        reviewRow(song: song, isKept: true)
+                    }
+                } header: {
+                    Text("Keep · \(reviewedKeptSongs.count)")
+                } footer: {
+                    Text("Tap the archive button to move a song out of the new playlist.")
+                }
+
+                Section {
+                    ForEach(reviewedRemovedSongs) { song in
+                        reviewRow(song: song, isKept: false)
+                    }
+                } header: {
+                    Text("Archived · \(reviewedRemovedSongs.count)")
+                } footer: {
+                    Text("Tap the restore button to put a song back into the new playlist.")
                 }
             }
 
@@ -169,9 +218,12 @@ struct SaveRetunedPlaylistView: View {
                     Button("Save to \(platform == "spotify" ? "Spotify" : "Apple Music")") {
                         Task {
                             if platform == "spotify" {
-                                await vm.saveToSpotify(name: newName, keptSongs: keptSongs)
+                                await vm.saveToSpotify(name: newName, keptSongs: reviewedKeptSongs)
                             } else {
-                                await vm.saveToAppleMusic(name: newName, keptSongs: keptSongs)
+                                await vm.saveToAppleMusic(name: newName, keptSongs: reviewedKeptSongs)
+                            }
+                            if case .success = vm.saveState {
+                                onSaveSucceeded()
                             }
                         }
                     }
@@ -201,10 +253,23 @@ struct SaveRetunedPlaylistView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Saved!")
                                 .font(.body.weight(.medium))
-                            Text("\"\(name)\" · \(keptSongs.count) songs")
+                            Text("\"\(name)\" · \(reviewedKeptSongs.count) songs")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    }
+                    .padding(.vertical, 4)
+
+                case .partialSuccess(let name, let added, let total):
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Partially saved", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.body.weight(.medium))
+                        Text("\"\(name)\" was created, but only \(added) of \(total) songs were added. Your Retune session has been kept so you can review it.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Retry by creating another playlist") { vm.saveState = .idle }
+                            .font(.caption)
                     }
                     .padding(.vertical, 4)
 
@@ -228,7 +293,7 @@ struct SaveRetunedPlaylistView: View {
 
             if !vm.isWorking {
                 Section {
-                    Button("Discard", role: .destructive) { dismiss() }
+                    Button("Back to Summary") { dismiss() }
                 }
             }
         }
@@ -243,7 +308,7 @@ struct SaveRetunedPlaylistView: View {
 
     private var isFinalState: Bool {
         switch vm.saveState {
-        case .success, .noSubscription: return true
+        case .success, .partialSuccess, .noSubscription: return true
         default: return false
         }
     }
@@ -255,6 +320,54 @@ struct SaveRetunedPlaylistView: View {
                 .foregroundStyle(.secondary)
                 .font(.subheadline)
         }
+    }
+
+    private func reviewRow(song: Song, isKept: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "music.note")
+                .foregroundStyle(isKept ? .green : .secondary)
+                .frame(width: 28, height: 28)
+                .background((isKept ? Color.green : Color.secondary).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(song.title)
+                    .lineLimit(1)
+                Text(song.artist)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button {
+                moveSong(song, toKept: !isKept)
+            } label: {
+                Image(systemName: isKept ? "archivebox" : "arrow.uturn.backward")
+                    .foregroundStyle(isKept ? .red : .green)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isKept ? "Archive \(song.title)" : "Keep \(song.title)")
+        }
+    }
+
+    private func moveSong(_ song: Song, toKept: Bool) {
+        if toKept {
+            reviewedRemovedSongs.removeAll { $0.id == song.id }
+            reviewedKeptSongs.append(song)
+        } else {
+            reviewedKeptSongs.removeAll { $0.id == song.id }
+            reviewedRemovedSongs.append(song)
+        }
+        let originalIndex = Dictionary(
+            uniqueKeysWithValues: originalSongs.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        reviewedKeptSongs.sort { originalIndex[$0.id, default: .max] < originalIndex[$1.id, default: .max] }
+        reviewedRemovedSongs.sort { originalIndex[$0.id, default: .max] < originalIndex[$1.id, default: .max] }
+        onReviewChanged(reviewedKeptSongs, reviewedRemovedSongs)
     }
 
     private var noSubscriptionView: some View {
