@@ -29,36 +29,11 @@ struct LaunchScreenView: View {
                 Spacer()
 
                 // ── Logo mark ──────────────────────────────────────────────
-                ZStack {
-                    // Outer glow ring
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [Color.purple.opacity(0.35), .clear],
-                                center: .center,
-                                startRadius: 30,
-                                endRadius: 80
-                            )
-                        )
-                        .frame(width: 160, height: 160)
-                        .scaleEffect(logoScale)
-
-                    // Icon background pill
-                    RoundedRectangle(cornerRadius: 28)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.purple, Color.indigo],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 100, height: 100)
-                        .shadow(color: .purple.opacity(0.5), radius: 24, y: 8)
-
-                    Image(systemName: "music.note.list")
-                        .font(.system(size: 44, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
+                Image("RetuneIcon")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 170, height: 170)
+                    .clipShape(RoundedRectangle(cornerRadius: 36, style: .continuous))
                 .scaleEffect(logoScale)
                 .opacity(logoOpacity)
 

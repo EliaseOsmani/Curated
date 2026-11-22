@@ -46,7 +46,10 @@ final class SessionSetupVM: ObservableObject {
             let detailed = try await playlist.with([.tracks])
             guard let tracks = detailed.tracks else { songs = []; return }
 
-            let mkSongs: [MusicKit.Song] = tracks.compactMap { $0 as? MusicKit.Song }
+            let mkSongs: [MusicKit.Song] = tracks.compactMap { track in
+                guard case let .song(song) = track else { return nil }
+                return song
+            }
             songs = mkSongs.map {
                 Song(
                     title: $0.title,

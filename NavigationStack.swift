@@ -130,11 +130,20 @@ struct HomeView: View {
                 if isLoading {
                     loadingView
                 } else if let msg = errorMessage {
-                    ContentUnavailableView(
-                        "Couldn't load playlists",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(msg)
-                    )
+                    VStack(spacing: 16) {
+                        ContentUnavailableView(
+                            "Couldn't load playlists",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text(msg)
+                        )
+
+                        Button {
+                            Task { await loadForPlatform(activePlatform) }
+                        } label: {
+                            Label("Try Again", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 } else if currentPlaylists.isEmpty {
                     ContentUnavailableView(
                         "No Playlists Found",
@@ -151,7 +160,13 @@ struct HomeView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Retune")
         .navigationBarTitleDisplayMode(.large)
-        .task { await loadAll() }
+        .task {
+            // Let the onboarding-to-Home transition render before MusicKit
+            // begins its first library/account request.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await loadAll()
+        }
         .onChange(of: appState.connectedService) { _, _ in
             Task { await loadAll() }
         }

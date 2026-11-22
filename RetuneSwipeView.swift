@@ -12,7 +12,7 @@ final class RetuneSessionVM: ObservableObject {
     @Published var songs: [Song] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
-    @State private var selected: PlaylistSelection?
+    // @State private var selected: PlaylistSelection?
 
     let playlist: Playlist
 
@@ -33,7 +33,10 @@ final class RetuneSessionVM: ObservableObject {
                 return
             }
 
-            let musicKitSongs: [MusicKit.Song] = tracks.compactMap { $0 as? MusicKit.Song }
+            let musicKitSongs: [MusicKit.Song] = tracks.compactMap { track in
+                guard case let .song(song) = track else { return nil }
+                return song
+            }
 
             songs = musicKitSongs.map {
                 Song(

@@ -57,10 +57,19 @@ final class AppStateManager: ObservableObject {
     // MARK: - Boot sequence (called from LaunchScreenView)
 
     func boot() async {
-        try? await Task.sleep(for: .milliseconds(800))
-        await refreshServiceState()
+        // Route from Retune's local connection state instead of making launch
+        // wait for MusicKit to resolve the device's Apple Music account. The
+        // playlist request performs the authoritative permission check.
+        try? await Task.sleep(for: .milliseconds(350))
 
-        phase = connectedService == .appleMusic ? .home : .onboarding
+        if hasCompletedOnboarding && !isAppleMusicDisconnected {
+            connectedService = .appleMusic
+            activeService = .appleMusic
+            phase = .home
+        } else {
+            connectedService = .none
+            phase = .onboarding
+        }
     }
 
     // MARK: - Service detection
@@ -83,11 +92,14 @@ final class AppStateManager: ObservableObject {
     }
 
     func completeOnboarding() {
-        guard connectedService == .appleMusic else {
-            phase = .onboarding
-            return
-        }
+        // This screen is reachable only after MusicAuthorization succeeds.
+        // Do not revalidate MusicKit/account state here: Apple's account
+        // daemon can be slow or temporarily unavailable, and onboarding
+        // completion is a local navigation decision.
+        UserDefaults.standard.set(false, forKey: appleMusicDisconnectedKey)
         UserDefaults.standard.set(true, forKey: onboardingKey)
+        connectedService = .appleMusic
+        activeService = .appleMusic
         phase = .home
     }
 
@@ -98,8 +110,9 @@ final class AppStateManager: ObservableObject {
         let status = await MusicAuthorization.request()
         if status == .authorized {
             UserDefaults.standard.set(false, forKey: appleMusicDisconnectedKey)
+            connectedService = .appleMusic
+            activeService = .appleMusic
         }
-        await refreshServiceState()
         return status == .authorized
     }
 
@@ -110,7 +123,8 @@ final class AppStateManager: ObservableObject {
 
     func disconnectAppleMusic() async {
         UserDefaults.standard.set(true, forKey: appleMusicDisconnectedKey)
-        await refreshServiceState()
+        connectedService = .none
+        activeService = .appleMusic
         phase = .onboarding
     }
 }
