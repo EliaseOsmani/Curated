@@ -29,6 +29,7 @@ struct RetuneSwipeView: View {
     @State private var showDiscardConfirmation = false
     @State private var sessionWasSaved = false
     @State private var screenTint: Color = .black
+    @State private var dragProgress: CGFloat = 0
 
     // SwiftData
     @Environment(\.modelContext) private var modelContext
@@ -57,6 +58,8 @@ struct RetuneSwipeView: View {
                 .opacity(0.75)
                 .ignoresSafeArea()
 
+            SwipeGlow(progress: $dragProgress)
+
             if remainingSongs.isEmpty {
                 sessionCompleteView
             } else {
@@ -73,9 +76,18 @@ struct RetuneSwipeView: View {
                     undoButton
                         .padding(.bottom, 24)
                 }
+
+                SwipeDecisionTag(progress: $dragProgress)
             }
         }
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: remainingSongs.first?.id) {
+            // Have the next two cards' artwork ready before they're needed.
+            for song in remainingSongs.dropFirst().prefix(2) {
+                guard !Task.isCancelled else { return }
+                await ImageLoader.preload(song.artworkURL)
+            }
+        }
         .navigationDestination(isPresented: $goToSave) {
             SaveRetunedPlaylistView(
                 keptSongs: keptSongs,
@@ -153,8 +165,10 @@ struct RetuneSwipeView: View {
                     song: remainingSongs[1],
                     isTopCard: false,
                     onSwipeFinished: { _ in },
-                    tintColor: .constant(.gray)
+                    tintColor: .constant(.gray),
+                    dragProgress: .constant(0)
                 )
+                .id(remainingSongs[1].id)
                 .scaleEffect(0.95)
                 .offset(y: 14)
                 .opacity(0.9)
@@ -170,7 +184,8 @@ struct RetuneSwipeView: View {
                     else           { removedSongs.append(decided) }
                     persistDecision(song: decided, kept: swipedRight)
                 },
-                tintColor: $screenTint
+                tintColor: $screenTint,
+                dragProgress: $dragProgress
             )
             .id(remainingSongs[0].id)
         }

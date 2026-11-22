@@ -55,25 +55,16 @@ final class SavePlaylistVM: ObservableObject {
             return
         }
 
-        var catalogSongs: [MusicKit.Song] = []
+        let resolvedSongs: [MusicKit.Song]
         do {
-            let batchSize = 25
-            for batchStart in stride(from: 0, to: songIDs.count, by: batchSize) {
-                let batchEnd  = min(batchStart + batchSize, songIDs.count)
-                let batchIDs  = Array(songIDs[batchStart..<batchEnd])
-                var request   = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.id, memberOf: batchIDs)
-                request.limit = batchSize
-                let response  = try await request.response()
-                let ordered   = batchIDs.compactMap { id in response.items.first(where: { $0.id == id }) }
-                catalogSongs.append(contentsOf: ordered)
-            }
+            resolvedSongs = try await resolveSongs(ids: songIDs)
         } catch {
-            saveState = handleMusicKitError(error, fallback: "Couldn't look up songs in Apple Music catalog.")
+            saveState = handleMusicKitError(error, fallback: "Couldn't look up songs in Apple Music.")
             return
         }
 
-        guard !catalogSongs.isEmpty else {
-            saveState = .failed("Couldn't find any of the kept songs in the Apple Music catalog.")
+        guard !resolvedSongs.isEmpty else {
+            saveState = .failed("Couldn't find any of the kept songs in Apple Music.")
             return
         }
 
@@ -91,13 +82,15 @@ final class SavePlaylistVM: ObservableObject {
         }
 
         var addedCount = 0
-        for (index, song) in catalogSongs.enumerated() {
-            saveState = .addingTracks(current: index + 1, total: catalogSongs.count)
+        var firstAddError: Error?
+        for (index, song) in resolvedSongs.enumerated() {
+            saveState = .addingTracks(current: index + 1, total: resolvedSongs.count)
             do {
                 try await MusicLibrary.shared.add(song, to: newPlaylist)
                 addedCount += 1
             } catch {
-                print("[Retune] Couldn't add \(song.title): \(error.localizedDescription)")
+                firstAddError = firstAddError ?? error
+                print("[Retune] Couldn't add \(song.title): \(error)")
             }
         }
 
@@ -105,7 +98,14 @@ final class SavePlaylistVM: ObservableObject {
         if addedCount == expectedCount {
             saveState = .success(playlistName: name)
         } else if addedCount == 0 {
-            saveState = .failed("Playlist was created but no songs could be added. Try again.")
+            if let firstAddError {
+                saveState = handleMusicKitError(
+                    firstAddError,
+                    fallback: "Playlist was created but no songs could be added. Try again."
+                )
+            } else {
+                saveState = .failed("Playlist was created but no songs could be added. Try again.")
+            }
         } else {
             saveState = .partialSuccess(playlistName: name, added: addedCount, total: expectedCount)
         }
@@ -126,6 +126,36 @@ final class SavePlaylistVM: ObservableObject {
         } catch {
             saveState = .failed(error.localizedDescription)
         }
+    }
+
+    /// Songs from a library playlist carry library IDs ("i.…"), which the
+    /// catalog doesn't recognize. Resolve each ID from the right source and
+    /// return the songs in the original order, keeping repeated tracks.
+    private func resolveSongs(ids: [MusicItemID]) async throws -> [MusicKit.Song] {
+        let uniqueIDs = Array(Set(ids))
+        let libraryIDs = uniqueIDs.filter { $0.rawValue.hasPrefix("i.") }
+        let catalogIDs = uniqueIDs.filter { !$0.rawValue.hasPrefix("i.") }
+        let batchSize = 25
+        var songsByID: [MusicItemID: MusicKit.Song] = [:]
+
+        for batchStart in stride(from: 0, to: libraryIDs.count, by: batchSize) {
+            let batch = Array(libraryIDs[batchStart..<min(batchStart + batchSize, libraryIDs.count)])
+            var request = MusicLibraryRequest<MusicKit.Song>()
+            request.filter(matching: \.id, memberOf: batch)
+            request.limit = batchSize
+            let response = try await request.response()
+            response.items.forEach { songsByID[$0.id] = $0 }
+        }
+
+        for batchStart in stride(from: 0, to: catalogIDs.count, by: batchSize) {
+            let batch = Array(catalogIDs[batchStart..<min(batchStart + batchSize, catalogIDs.count)])
+            var request = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.id, memberOf: batch)
+            request.limit = batchSize
+            let response = try await request.response()
+            response.items.forEach { songsByID[$0.id] = $0 }
+        }
+
+        return ids.compactMap { songsByID[$0] }
     }
 
     private func handleMusicKitError(_ error: Error, fallback: String) -> SaveState {
@@ -205,104 +235,128 @@ struct SaveRetunedPlaylistView: View {
                 }
             }
 
-            if !isFinalState {
-                Section("New Playlist Name") {
-                    TextField("My Retuned Playlist", text: $newName)
-                        .disabled(vm.isWorking)
-                }
-            }
-
-            Section {
-                switch vm.saveState {
-                case .idle:
-                    Button("Save to \(platform == "spotify" ? "Spotify" : "Apple Music")") {
-                        Task {
-                            if platform == "spotify" {
-                                await vm.saveToSpotify(name: newName, keptSongs: reviewedKeptSongs)
-                            } else {
-                                await vm.saveToAppleMusic(name: newName, keptSongs: reviewedKeptSongs)
-                            }
-                            if case .success = vm.saveState {
-                                onSaveSucceeded()
-                            }
-                        }
-                    }
-                    .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                case .checkingSubscription:
-                    progressRow(label: "Checking Apple Music…", icon: "music.note")
-
-                case .lookingUpTracks:
-                    progressRow(label: "Looking up tracks…", icon: "magnifyingglass")
-
-                case .creatingPlaylist:
-                    progressRow(label: "Creating playlist…", icon: "plus.circle")
-
-                case .addingTracks(let current, let total):
-                    VStack(alignment: .leading, spacing: 8) {
-                        progressRow(label: "Adding tracks (\(current) of \(total))…", icon: "music.note.list")
-                        ProgressView(value: Double(current), total: Double(total))
-                            .tint(.green)
-                    }
-
-                case .success(let name):
-                    HStack(spacing: 10) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                            .font(.title3)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Saved!")
-                                .font(.body.weight(.medium))
-                            Text("\"\(name)\" · \(reviewedKeptSongs.count) songs")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(.vertical, 4)
-
-                case .partialSuccess(let name, let added, let total):
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Partially saved", systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.body.weight(.medium))
-                        Text("\"\(name)\" was created, but only \(added) of \(total) songs were added. Your Retune session has been kept so you can review it.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button("Retry by creating another playlist") { vm.saveState = .idle }
-                            .font(.caption)
-                    }
-                    .padding(.vertical, 4)
-
-                case .noSubscription:
-                    noSubscriptionView
-
-                case .failed(let msg):
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Save failed", systemImage: "xmark.circle.fill")
-                            .foregroundStyle(.red)
-                            .font(.body.weight(.medium))
-                        Text(msg)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button("Try Again") { vm.saveState = .idle }
-                            .font(.caption)
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
-
             if !vm.isWorking {
                 Section {
                     Button("Back to Summary") { dismiss() }
                 }
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) { saveBar }
         .navigationTitle("Save Playlist")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if newName.isEmpty {
                 newName = "Retuned • \(Date().formatted(date: .abbreviated, time: .omitted))"
             }
+        }
+    }
+
+    // MARK: - Pinned save bar
+
+    private var saveBar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !isFinalState {
+                TextField("Playlist name", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(vm.isWorking)
+                    .accessibilityLabel("New playlist name")
+            }
+
+            saveStatus
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    @ViewBuilder
+    private var saveStatus: some View {
+        switch vm.saveState {
+        case .idle:
+            Button {
+                Task {
+                    if platform == "spotify" {
+                        await vm.saveToSpotify(name: newName, keptSongs: reviewedKeptSongs)
+                    } else {
+                        await vm.saveToAppleMusic(name: newName, keptSongs: reviewedKeptSongs)
+                    }
+                    if case .success = vm.saveState {
+                        onSaveSucceeded()
+                    }
+                }
+            } label: {
+                Label(
+                    "Save to \(platform == "spotify" ? "Spotify" : "Apple Music")",
+                    systemImage: "music.note.list"
+                )
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+        case .checkingSubscription:
+            progressRow(label: "Checking Apple Music…", icon: "music.note")
+
+        case .lookingUpTracks:
+            progressRow(label: "Looking up tracks…", icon: "magnifyingglass")
+
+        case .creatingPlaylist:
+            progressRow(label: "Creating playlist…", icon: "plus.circle")
+
+        case .addingTracks(let current, let total):
+            VStack(alignment: .leading, spacing: 8) {
+                progressRow(label: "Adding tracks (\(current) of \(total))…", icon: "music.note.list")
+                ProgressView(value: Double(current), total: Double(total))
+                    .tint(.green)
+            }
+
+        case .success(let name):
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.title3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Saved!")
+                        .font(.body.weight(.medium))
+                    Text("\"\(name)\" · \(reviewedKeptSongs.count) songs")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+
+        case .partialSuccess(let name, let added, let total):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Partially saved", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.body.weight(.medium))
+                Text("\"\(name)\" was created, but only \(added) of \(total) songs were added. Your Retune session has been kept so you can review it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Retry by creating another playlist") { vm.saveState = .idle }
+                    .font(.caption)
+            }
+            .padding(.vertical, 4)
+
+        case .noSubscription:
+            noSubscriptionView
+
+        case .failed(let msg):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Save failed", systemImage: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .font(.body.weight(.medium))
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Try Again") { vm.saveState = .idle }
+                    .font(.caption)
+            }
+            .padding(.vertical, 4)
         }
     }
 

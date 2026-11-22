@@ -6,6 +6,7 @@
 import SwiftUI
 import MusicKit
 import Combine
+import SwiftData
 
 // MARK: - Order Mode
 
@@ -26,25 +27,32 @@ enum SessionOrderMode: String, CaseIterable {
 @MainActor
 final class SessionSetupVM: ObservableObject {
     @Published var songs: [Song] = []
+    @Published private(set) var shuffledSongs: [Song] = []
     @Published var isLoading = true
+    @Published var loadedSongCount = 0
     @Published var errorMessage: String?
-    @Published var orderMode: SessionOrderMode = .inOrder
+    @Published private(set) var orderMode: SessionOrderMode = .inOrder
 
     let playlist: Playlist
+    private var hasLoaded = false
 
     init(playlist: Playlist) {
         self.playlist = playlist
     }
 
-    // Load songs eagerly in the background while the user reads the setup screen
+    // Load songs eagerly in the background while the user reads the setup screen.
+    // Runs once: Song IDs and the shuffled order must survive returning here.
     func loadSongs() async {
+        guard !hasLoaded else { return }
         isLoading = true
+        loadedSongCount = 0
         errorMessage = nil
         defer { isLoading = false }
 
         do {
-            let detailed = try await playlist.with([.tracks])
-            guard let tracks = detailed.tracks else { songs = []; return }
+            let tracks = try await AppleMusicTracks.all(in: playlist) { [weak self] count in
+                self?.loadedSongCount = count
+            }
 
             let mkSongs: [MusicKit.Song] = tracks.compactMap { track in
                 guard case let .song(song) = track else { return nil }
@@ -59,14 +67,26 @@ final class SessionSetupVM: ObservableObject {
                     musicItemID: $0.id.rawValue
                 )
             }
+            if orderMode == .shuffled { shuffledSongs = songs.shuffled() }
+            hasLoaded = true
+        } catch is CancellationError {
+            return
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    // Apply order mode and return the final song list for the session
+    /// Selecting Shuffle while it's already selected makes a new order.
+    func select(_ mode: SessionOrderMode) {
+        if mode == .shuffled, orderMode == .shuffled || shuffledSongs.isEmpty {
+            shuffledSongs = songs.shuffled()
+        }
+        orderMode = mode
+    }
+
+    /// The exact order shown on screen and used for the session.
     var orderedSongs: [Song] {
-        orderMode == .shuffled ? songs.shuffled() : songs
+        orderMode == .shuffled ? shuffledSongs : songs
     }
 }
 
@@ -76,15 +96,25 @@ struct SessionSetupView: View {
     let playlist: Playlist
 
     @StateObject private var vm: SessionSetupVM
+    @Environment(\.modelContext) private var modelContext
+    @Query private var savedSessions: [SessionRecord]
+
     @State private var navigateToSession = false
     @State private var sessionSongs: [Song] = []
+    @State private var sessionOrderMode = SessionOrderMode.inOrder.rawValue
+    @State private var showStartOverConfirmation = false
     @State private var artworkImage: UIImage? = nil
     @State private var tintColor: Color = .purple
 
     init(playlist: Playlist) {
         self.playlist = playlist
         _vm = StateObject(wrappedValue: SessionSetupVM(playlist: playlist))
+        let playlistID = playlist.id.rawValue
+        _savedSessions = Query(filter: #Predicate<SessionRecord> { $0.playlistID == playlistID })
     }
+
+    private var existingSession: SessionRecord? { savedSessions.first }
+    private var canStart: Bool { !vm.isLoading && !vm.songs.isEmpty }
 
     var body: some View {
         ZStack {
@@ -100,26 +130,66 @@ struct SessionSetupView: View {
 
             ScrollView {
                 VStack(spacing: 28) {
-
                     artworkHeader
                     songCountBadge
                     orderPicker
-                    Spacer(minLength: 0)
-                    startButton
-
+                    songList
                 }
                 .padding(24)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                actionBar
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+                    .background(.bar)
             }
         }
         .navigationTitle("Session Setup")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            await loadArtwork()
+            // Songs shouldn't wait for the cover image.
+            async let artwork: Void = loadArtwork()
             await vm.loadSongs()
+            await artwork
         }
         .navigationDestination(isPresented: $navigateToSession) {
-            RetuneSwipeView(songs: sessionSongs, playlistID: playlist.id.rawValue, playlistName: playlist.name, orderMode: vm.orderMode.rawValue)
+            RetuneSwipeView(
+                songs: sessionSongs,
+                playlistID: playlist.id.rawValue,
+                playlistName: playlist.name,
+                orderMode: sessionOrderMode
+            )
         }
+        .confirmationDialog(
+            "Start over?",
+            isPresented: $showStartOverConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Progress and Start Over", role: .destructive) { startOver() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your saved swipes for this playlist will be permanently removed.")
+        }
+    }
+
+    // MARK: - Session actions
+
+    private func startNewSession() {
+        sessionSongs = vm.orderedSongs
+        sessionOrderMode = vm.orderMode.rawValue
+        navigateToSession = true
+    }
+
+    private func resume(_ session: SessionRecord) {
+        sessionSongs = session.allSongs
+        sessionOrderMode = session.orderMode
+        navigateToSession = true
+    }
+
+    private func startOver() {
+        savedSessions.forEach { modelContext.delete($0) }
+        try? modelContext.save()
+        startNewSession()
     }
 
     // MARK: - Artwork Header
@@ -167,7 +237,7 @@ struct SessionSetupView: View {
             if vm.isLoading {
                 HStack(spacing: 6) {
                     ProgressView().scaleEffect(0.8)
-                    Text("Loading songs…")
+                    Text(vm.loadedSongCount > 0 ? "Loading songs… \(vm.loadedSongCount)" : "Loading songs…")
                         .foregroundStyle(.secondary)
                 }
             } else if let err = vm.errorMessage {
@@ -207,7 +277,7 @@ struct SessionSetupView: View {
 
         return Button {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                vm.orderMode = mode
+                vm.select(mode)
             }
         } label: {
             HStack(spacing: 8) {
@@ -231,12 +301,84 @@ struct SessionSetupView: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: - Song List
+
+    @ViewBuilder
+    private var songList: some View {
+        if !vm.orderedSongs.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Songs")
+                        .font(.headline)
+                    Text(songListCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(vm.orderedSongs.enumerated()), id: \.element.id) { index, song in
+                        SetupSongRow(position: index + 1, song: song)
+                        if index < vm.orderedSongs.count - 1 {
+                            Divider().padding(.leading, 84)
+                        }
+                    }
+                }
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .transaction { $0.animation = nil }
+            }
+        }
+    }
+
+    private var songListCaption: String {
+        if existingSession != nil {
+            return "Start Over uses this order. Resume keeps your saved order."
+        }
+        return vm.orderMode == .shuffled
+            ? "Shuffled order. Tap Shuffle again to reshuffle."
+            : "Playlist order"
+    }
+
+    // MARK: - Action Bar
+
+    @ViewBuilder
+    private var actionBar: some View {
+        if let session = existingSession {
+            VStack(spacing: 8) {
+                Button {
+                    resume(session)
+                } label: {
+                    primaryLabel(title: "Resume Session", icon: "arrow.counterclockwise")
+                        .background(tintColor)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                }
+
+                Button("Start Over", role: .destructive) {
+                    showStartOverConfirmation = true
+                }
+                .font(.subheadline.weight(.medium))
+                .frame(minHeight: 32)
+                .disabled(!canStart)
+            }
+        } else {
+            startButton
+        }
+    }
+
+    private func primaryLabel(title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.headline)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+    }
+
     // MARK: - Start Button
 
     private var startButton: some View {
         Button {
-            sessionSongs = vm.orderedSongs
-            navigateToSession = true
+            startNewSession()
         } label: {
             HStack(spacing: 10) {
                 if vm.isLoading {
@@ -250,19 +392,11 @@ struct SessionSetupView: View {
             .font(.headline)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 18)
-            .background(
-                vm.isLoading || vm.songs.isEmpty
-                    ? Color(.systemFill)
-                    : tintColor
-            )
-            .foregroundStyle(vm.isLoading || vm.songs.isEmpty ? Color.secondary : .white)
+            .background(canStart ? tintColor : Color(.systemFill))
+            .foregroundStyle(canStart ? .white : Color.secondary)
             .clipShape(RoundedRectangle(cornerRadius: 16))
-            .shadow(
-                color: vm.isLoading ? .clear : tintColor.opacity(0.4),
-                radius: 12, y: 4
-            )
         }
-        .disabled(vm.isLoading || vm.songs.isEmpty)
+        .disabled(!canStart)
         .animation(.easeInOut(duration: 0.2), value: vm.isLoading)
     }
 
@@ -272,13 +406,105 @@ struct SessionSetupView: View {
         guard let url = playlist.artwork?.url(width: 320, height: 320) else { return }
         if let cached = ImageCache.shared.image(for: url) {
             artworkImage = cached
-            if let avg = cached.averageColor { tintColor = Color(uiColor: avg) }
+            if let avg = await cached.averageColorInBackground { tintColor = Color(uiColor: avg) }
             return
         }
         guard let (data, _) = try? await URLSession.shared.data(from: url),
               let img = UIImage(data: data) else { return }
         ImageCache.shared.set(img, for: url)
         artworkImage = img
-        if let avg = img.averageColor { tintColor = Color(uiColor: avg) }
+        if let avg = await img.averageColorInBackground { tintColor = Color(uiColor: avg) }
+    }
+}
+
+// MARK: - Song Row
+
+private struct SetupSongRow: View {
+    let position: Int
+    let song: Song
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("\(position)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 26, alignment: .trailing)
+
+            SongThumbnail(url: song.artworkURL)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(song.title)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text(song.artist)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Thumbnail
+
+/// Decodes a small copy off the main thread so long song lists scroll smoothly.
+private struct SongThumbnail: View {
+    let url: URL?
+
+    private static let cache = NSCache<NSURL, UIImage>()
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(.systemFill))
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "music.note")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 40, height: 40)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        guard let url else { image = nil; return }
+        if let cached = Self.cache.object(forKey: url as NSURL) {
+            image = cached
+            return
+        }
+        image = nil
+        guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
+        let thumbnail = await Task.detached(priority: .utility) {
+            Self.downsample(data)
+        }.value
+        guard !Task.isCancelled, let thumbnail else { return }
+        Self.cache.setObject(thumbnail, forKey: url as NSURL)
+        image = thumbnail
+    }
+
+    private nonisolated static func downsample(_ data: Data) -> UIImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else { return nil }
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 120
+        ] as CFDictionary
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
+        return UIImage(cgImage: cgImage)
     }
 }
