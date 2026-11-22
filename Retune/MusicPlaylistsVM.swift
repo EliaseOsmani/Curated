@@ -135,35 +135,48 @@ final class MusicPlaylistsVM: ObservableObject {
     }
 
     private func fetchLibraryPlaylists() async throws -> [Playlist] {
-        try await withThrowingTaskGroup(of: [Playlist].self) { group in
-            group.addTask {
-                var request = MusicLibraryRequest<Playlist>()
-                request.limit = 50
-                let response = try await request.response()
-
-                var batch = response.items
-                var all = Array(batch)
-                while batch.hasNextBatch {
-                    try Task.checkCancellation()
-                    guard let next = try await batch.nextBatch() else { break }
-                    all.append(contentsOf: next)
-                    batch = next
+        // Not a task group: a group can't exit until every child finishes, so
+        // a stalled MusicKit request would hold back the timeout error.
+        let results = AsyncThrowingStream<[Playlist], Error> { continuation in
+            let fetch = Task {
+                do {
+                    continuation.yield(try await Self.requestLibraryPlaylists())
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
                 }
-                return all
             }
-
-            group.addTask {
-                try await Task.sleep(for: .seconds(15))
-                try Task.checkCancellation()
-                throw PlaylistLoadError.timedOut
+            let timeout = Task {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                continuation.finish(throwing: PlaylistLoadError.timedOut)
             }
-
-            guard let result = try await group.next() else {
-                throw CancellationError()
+            continuation.onTermination = { _ in
+                fetch.cancel()
+                timeout.cancel()
             }
-            group.cancelAll()
-            return result
         }
+
+        for try await playlists in results {
+            return playlists
+        }
+        throw CancellationError()
+    }
+
+    private nonisolated static func requestLibraryPlaylists() async throws -> [Playlist] {
+        var request = MusicLibraryRequest<Playlist>()
+        request.limit = 50
+        let response = try await request.response()
+
+        var batch = response.items
+        var all = Array(batch)
+        while batch.hasNextBatch {
+            try Task.checkCancellation()
+            guard let next = try await batch.nextBatch() else { break }
+            all.append(contentsOf: next)
+            batch = next
+        }
+        return all
     }
 
     private func apply(_ libraryPlaylists: [Playlist]) {

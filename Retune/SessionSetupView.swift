@@ -54,18 +54,28 @@ final class SessionSetupVM: ObservableObject {
                 self?.loadedSongCount = count
             }
 
-            let mkSongs: [MusicKit.Song] = tracks.compactMap { track in
-                guard case let .song(song) = track else { return nil }
-                return song
-            }
-            songs = mkSongs.map {
-                Song(
-                    title: $0.title,
-                    artist: $0.artistName,
-                    artworkURL: $0.artwork?.url(width: 600, height: 600),
-                    previewURL: $0.previewAssets?.first?.url,
-                    musicItemID: $0.id.rawValue
-                )
+            songs = tracks.compactMap { track in
+                if case let .song(song) = track {
+                    return Song(
+                        title: song.title,
+                        artist: song.artistName,
+                        artworkURL: song.artwork?.url(width: 600, height: 600),
+                        previewURL: song.previewAssets?.first?.url,
+                        musicItemID: song.id.rawValue,
+                        isrc: song.isrc
+                    )
+                }
+                if case let .musicVideo(video) = track {
+                    return Song(
+                        title: video.title,
+                        artist: video.artistName,
+                        artworkURL: video.artwork?.url(width: 600, height: 600),
+                        previewURL: video.previewAssets?.first?.url,
+                        musicItemID: video.id.rawValue,
+                        isMusicVideo: true
+                    )
+                }
+                return nil
             }
             if orderMode == .shuffled { shuffledSongs = songs.shuffled() }
             hasLoaded = true

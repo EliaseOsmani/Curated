@@ -15,6 +15,10 @@ struct Song: Identifiable, Codable, Hashable {
     let artworkURL: URL?
     let previewURL: URL?
     let musicItemID: String?
+    /// Optional so sessions saved before this field existed still decode.
+    let isMusicVideo: Bool?
+    /// Finds the matching catalog recording. Absent from older saved sessions.
+    let isrc: String?
 
     init(
         id: UUID = UUID(),
@@ -22,7 +26,9 @@ struct Song: Identifiable, Codable, Hashable {
         artist: String,
         artworkURL: URL? = nil,
         previewURL: URL? = nil,
-        musicItemID: String? = nil
+        musicItemID: String? = nil,
+        isMusicVideo: Bool = false,
+        isrc: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -30,5 +36,7 @@ struct Song: Identifiable, Codable, Hashable {
         self.artworkURL = artworkURL
         self.previewURL = previewURL
         self.musicItemID = musicItemID
+        self.isMusicVideo = isMusicVideo
+        self.isrc = isrc
     }
 }

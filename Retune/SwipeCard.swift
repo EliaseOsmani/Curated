@@ -26,9 +26,6 @@ struct SwipeCard: View {
     // -1 (full remove) to 1 (full keep). Drives the fixed tag and screen glow.
     @Binding var dragProgress: CGFloat
 
-    // Audio
-    @StateObject private var audio = AudioPreviewPlayer.shared
-
     // PDR: ~40% screen width OR velocity > 500 pts/sec
     private let swipeThresholdRatio: CGFloat = 0.40
     private let velocityThreshold:   CGFloat = 500
@@ -84,11 +81,9 @@ struct SwipeCard: View {
             .onAppear {
                 keepFeedback.prepare()
                 removeFeedback.prepare()
-                if isTopCard { audio.play(url: song.previewURL) }
             }
             .onDisappear {
                 if isTopCard {
-                    audio.stop()
                     dragProgress = 0
                 }
             }
@@ -109,9 +104,12 @@ struct SwipeCard: View {
             }
             .onEnded { gesture in
                 // PDR: commit on velocity > 500 pts/sec OR distance > threshold
-                let velocity = abs(gesture.predictedEndTranslation.width - gesture.translation.width)
-                let committedRight = offset.width > threshold  || (velocity > velocityThreshold && offset.width > 0)
-                let committedLeft  = offset.width < -threshold || (velocity > velocityThreshold && offset.width < 0)
+                // A fast flick back toward center cancels the swipe.
+                let velocity = gesture.velocity.width
+                let flickedRight = velocity > velocityThreshold && offset.width > 0
+                let flickedLeft  = velocity < -velocityThreshold && offset.width < 0
+                let committedRight = flickedRight || (offset.width > threshold && velocity >= -velocityThreshold)
+                let committedLeft  = flickedLeft  || (offset.width < -threshold && velocity <= velocityThreshold)
 
                 if committedRight      { swipeOut(toRight: true) }
                 else if committedLeft  { swipeOut(toRight: false) }
@@ -158,7 +156,6 @@ struct SwipeCard: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             lastThresholdState = .none
             isDraggingEnabled  = true
-            if isTopCard { audio.stop() }
             withAnimation(.easeOut(duration: 0.2)) {
                 dragProgress = 0
             }
