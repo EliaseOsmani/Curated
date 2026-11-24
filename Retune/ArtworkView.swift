@@ -10,17 +10,23 @@ struct ArtworkView: View {
     let url: URL?
     @Binding var tintColor: Color
 
-    @StateObject private var loader = ImageLoader()
+    @StateObject private var loader: ImageLoader
+
+    init(url: URL?, tintColor: Binding<Color>) {
+        self.url = url
+        _tintColor = tintColor
+        _loader = StateObject(wrappedValue: ImageLoader(url: url))
+    }
 
     var body: some View {
         Group {
             if let img = loader.image {
                 Image(uiImage: img)
                     .resizable()
-                    .onAppear {
-                        if let avg = img.averageColor {
-                            tintColor = Color(uiColor: avg)
-                        }
+                    .task(id: url) {
+                        let avg = await img.averageColorInBackground
+                        guard !Task.isCancelled, let avg else { return }
+                        tintColor = Color(uiColor: avg)
                     }
             } else {
                 Rectangle()
@@ -38,6 +44,6 @@ struct ArtworkView: View {
                     }
             }
         }
-        .task { await loader.load(from: url) }
+        .task(id: url) { await loader.load(from: url) }
     }
 }

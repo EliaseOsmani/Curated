@@ -23,8 +23,8 @@ struct SwipeCard: View {
     // Tint color driven by artwork (also passed up to parent for screen bg)
     @Binding var tintColor: Color
 
-    // Audio
-    @StateObject private var audio = AudioPreviewPlayer.shared
+    // -1 (full remove) to 1 (full keep). Drives the fixed tag and screen glow.
+    @Binding var dragProgress: CGFloat
 
     // PDR: ~40% screen width OR velocity > 500 pts/sec
     private let swipeThresholdRatio: CGFloat = 0.40
@@ -67,36 +67,6 @@ struct SwipeCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 28)
-
-                // ── Swipe direction labels ──────────────────────────────────
-                if isTopCard {
-                    HStack {
-                        if offset.width < -40 {
-                            Label("REMOVE", systemImage: "xmark")
-                                .font(.headline).fontWeight(.bold)
-                                .foregroundStyle(.white)
-                                .padding(.vertical, 8).padding(.horizontal, 14)
-                                .background(.red.opacity(0.85))
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .padding(.leading, 20)
-                                .transition(.opacity)
-                        }
-                        Spacer()
-                        if offset.width > 40 {
-                            Label("KEEP", systemImage: "checkmark")
-                                .font(.headline).fontWeight(.bold)
-                                .foregroundStyle(.white)
-                                .padding(.vertical, 8).padding(.horizontal, 14)
-                                .background(.green.opacity(0.85))
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .padding(.trailing, 20)
-                                .transition(.opacity)
-                        }
-                    }
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .padding(.top, 20)
-                    .animation(.easeInOut(duration: 0.15), value: offset.width)
-                }
             }
             .clipShape(RoundedRectangle(cornerRadius: 24))
             .shadow(color: .black.opacity(0.3), radius: 16, y: 8)
@@ -111,10 +81,11 @@ struct SwipeCard: View {
             .onAppear {
                 keepFeedback.prepare()
                 removeFeedback.prepare()
-                if isTopCard { audio.play(url: song.previewURL) }
             }
             .onDisappear {
-                if isTopCard { audio.stop() }
+                if isTopCard {
+                    dragProgress = 0
+                }
             }
         }
     }
@@ -126,13 +97,19 @@ struct SwipeCard: View {
             .onChanged { gesture in
                 offset   = gesture.translation
                 rotation = Double(gesture.translation.width / 18)
+                dragProgress = threshold > 0
+                    ? min(1, max(-1, gesture.translation.width / threshold))
+                    : 0
                 handleThresholdHaptics(for: offset.width, threshold: threshold)
             }
             .onEnded { gesture in
                 // PDR: commit on velocity > 500 pts/sec OR distance > threshold
-                let velocity = abs(gesture.predictedEndTranslation.width - gesture.translation.width)
-                let committedRight = offset.width > threshold  || (velocity > velocityThreshold && offset.width > 0)
-                let committedLeft  = offset.width < -threshold || (velocity > velocityThreshold && offset.width < 0)
+                // A fast flick back toward center cancels the swipe.
+                let velocity = gesture.velocity.width
+                let flickedRight = velocity > velocityThreshold && offset.width > 0
+                let flickedLeft  = velocity < -velocityThreshold && offset.width < 0
+                let committedRight = flickedRight || (offset.width > threshold && velocity >= -velocityThreshold)
+                let committedLeft  = flickedLeft  || (offset.width < -threshold && velocity <= velocityThreshold)
 
                 if committedRight      { swipeOut(toRight: true) }
                 else if committedLeft  { swipeOut(toRight: false) }
@@ -164,6 +141,7 @@ struct SwipeCard: View {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
             offset   = .zero
             rotation = 0
+            dragProgress = 0
         }
         lastThresholdState = .none
     }
@@ -173,12 +151,61 @@ struct SwipeCard: View {
         withAnimation(.easeOut(duration: 0.22)) {
             offset   = CGSize(width: toRight ? offscreenX : -offscreenX, height: offset.height * 0.2)
             rotation = toRight ? 18 : -18
+            dragProgress = toRight ? 1 : -1
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             lastThresholdState = .none
             isDraggingEnabled  = true
-            if isTopCard { audio.stop() }
+            withAnimation(.easeOut(duration: 0.2)) {
+                dragProgress = 0
+            }
             onSwipeFinished(toRight)
         }
+    }
+}
+
+// MARK: - Swipe Feedback
+
+/// Full-screen green or red glow that strengthens toward the swipe threshold.
+struct SwipeGlow: View {
+    @Binding var progress: CGFloat
+
+    var body: some View {
+        let color: Color = progress >= 0 ? .green : .red
+
+        RadialGradient(
+            colors: [color.opacity(0.35), color.opacity(0.95)],
+            center: .center,
+            startRadius: 120,
+            endRadius: 560
+        )
+        .opacity(abs(progress))
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// KEEP or REMOVE tag that stays centered on screen while the card moves.
+struct SwipeDecisionTag: View {
+    @Binding var progress: CGFloat
+
+    var body: some View {
+        let isKeep = progress >= 0
+        let color: Color = isKeep ? .green : .red
+        let strength = min(1, max(0, (abs(progress) - 0.12) / 0.45))
+
+        Label(isKeep ? "KEEP" : "REMOVE", systemImage: isKeep ? "checkmark" : "xmark")
+            .font(.title.weight(.heavy))
+            .foregroundStyle(.white)
+            .padding(.vertical, 14)
+            .padding(.horizontal, 26)
+            .background(color, in: Capsule())
+            .overlay(Capsule().stroke(.white.opacity(0.75), lineWidth: 2))
+            .shadow(color: color.opacity(0.9), radius: 24)
+            .scaleEffect(0.82 + 0.18 * strength)
+            .opacity(strength)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }

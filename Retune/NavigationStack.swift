@@ -78,6 +78,43 @@ enum PlaylistSortOption: String, CaseIterable {
         case .shortest:       return "arrow.up.to.line"
         }
     }
+
+    var needsTrackCounts: Bool {
+        self == .longest || self == .shortest
+    }
+
+    func sorted(_ playlists: [PlaylistSelection]) -> [PlaylistSelection] {
+        playlists.sorted { lhs, rhs in
+            switch self {
+            case .recentlyPlayed:
+                switch (lhs.lastPlayedDate, rhs.lastPlayedDate) {
+                case let (left?, right?) where left != right:
+                    return left > right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+
+            case .alphabetical:
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+
+            case .longest:
+                if lhs.trackCount != rhs.trackCount {
+                    return lhs.trackCount > rhs.trackCount
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+
+            case .shortest:
+                if lhs.trackCount != rhs.trackCount {
+                    return lhs.trackCount < rhs.trackCount
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+        }
+    }
 }
 
 // MARK: - Home View
@@ -94,9 +131,9 @@ struct HomeView: View {
         PlaylistSortOption.recentlyPlayed.rawValue
 
     @Query private var savedSessions: [SessionRecord]
-    @State private var resumeSongs:   [Song]?        = nil
-    @State private var resumeSession: SessionRecord? = nil
-    @State private var showResume = false
+    @Environment(\.modelContext) private var modelContext
+    @State private var resumeTarget: ResumeTarget?
+    @State private var sessionPendingDelete: PendingSessionDelete?
 
     // The service currently being shown — reads activeService when both connected,
     // otherwise derived directly from connectedService.
@@ -161,11 +198,29 @@ struct HomeView: View {
         .navigationTitle("Retune")
         .navigationBarTitleDisplayMode(.large)
         .task {
+            NSLog("[Retune] Home appeared")
+            appleMusicVM.setSortOption(playlistSortOption)
             // Let the onboarding-to-Home transition render before MusicKit
             // begins its first library/account request.
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
             await loadAll()
+        }
+        .onChange(of: playlistSortRawValue) { _, _ in
+            appleMusicVM.setSortOption(playlistSortOption)
+        }
+        .onChange(of: selected) { _, newValue in
+            appleMusicVM.setCountingPaused(newValue != nil || resumeTarget != nil)
+        }
+        .onChange(of: resumeTarget) { _, newValue in
+            appleMusicVM.setCountingPaused(newValue != nil || selected != nil)
+        }
+        .onChange(of: appState.returnHomeRequest) { _, _ in
+            selected = nil
+            resumeTarget = nil
+        }
+        .onChange(of: appState.pendingSyncPlaylist) { _, pending in
+            if let pending { appleMusicVM.watchForSync(id: pending.id, name: pending.name) }
         }
         .onChange(of: appState.connectedService) { _, _ in
             Task { await loadAll() }
@@ -182,6 +237,32 @@ struct HomeView: View {
             } else {
                 SessionSetupView(playlist: selection.appleMusicPlaylist!)
             }
+        }
+        .navigationDestination(item: $resumeTarget) { target in
+            RetuneSwipeView(
+                songs:        target.songs,
+                playlistID:   target.playlistID,
+                playlistName: target.playlistName,
+                orderMode:    target.orderMode
+            )
+        }
+        .confirmationDialog(
+            "Delete this session?",
+            isPresented: Binding(
+                get: { sessionPendingDelete != nil },
+                set: { if !$0 { sessionPendingDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: sessionPendingDelete
+        ) { pending in
+            Button("Delete Session", role: .destructive) {
+                modelContext.delete(pending.session)
+                try? modelContext.save()
+                sessionPendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { pending in
+            Text("Your swipes for \(pending.playlistName) will be permanently removed. Your Apple Music playlist won't change.")
         }
     }
 
@@ -222,50 +303,24 @@ struct HomeView: View {
     }
 
     private var currentPlaylists: [PlaylistSelection] {
-        let playlists: [PlaylistSelection]
         switch activePlatform {
         case .appleMusic:
-            playlists = appleMusicVM.playlists.map { PlaylistSelection(appleMusicPlaylist: $0) }
+            return appleMusicVM.selections
         case .spotify:
-            playlists = spotifyVM.playlists.map { PlaylistSelection(spotifyPlaylist: $0) }
+            return playlistSortOption.sorted(
+                spotifyVM.playlists.map { PlaylistSelection(spotifyPlaylist: $0) }
+            )
         }
-        return sort(playlists)
     }
 
     private var playlistSortOption: PlaylistSortOption {
         PlaylistSortOption(rawValue: playlistSortRawValue) ?? .recentlyPlayed
     }
 
-    private func sort(_ playlists: [PlaylistSelection]) -> [PlaylistSelection] {
-        playlists.sorted { lhs, rhs in
-            switch playlistSortOption {
-            case .recentlyPlayed:
-                switch (lhs.lastPlayedDate, rhs.lastPlayedDate) {
-                case let (left?, right?) where left != right:
-                    return left > right
-                case (_?, nil):
-                    return true
-                case (nil, _?):
-                    return false
-                default:
-                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-                }
-
-            case .alphabetical:
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-
-            case .longest:
-                if lhs.trackCount != rhs.trackCount {
-                    return lhs.trackCount > rhs.trackCount
-                }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-
-            case .shortest:
-                if lhs.trackCount != rhs.trackCount {
-                    return lhs.trackCount < rhs.trackCount
-                }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
+    private func refreshPlatform() async {
+        switch activePlatform {
+        case .appleMusic: await appleMusicVM.refresh()
+        case .spotify:    await spotifyVM.load()
         }
     }
 
@@ -299,10 +354,16 @@ struct HomeView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 4)
+                    .onAppear {
+                        if !selection.isSpotify {
+                            appleMusicVM.requestTrackCount(for: selection.id)
+                        }
+                    }
                 }
             }
             .padding(.bottom, 24)
         }
+        .refreshable { await refreshPlatform() }
         .background(Color(.systemGroupedBackground))
     }
 
@@ -362,53 +423,67 @@ struct HomeView: View {
     @ViewBuilder
     private var resumeBanner: some View {
         if let session = savedSessions.sorted(by: { $0.startedAt > $1.startedAt }).first {
-            Button {
-                resumeSession = session
-                resumeSongs   = session.allSongs
-                showResume    = true
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "arrow.counterclockwise.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.isComplete ? "Save Completed Session" : "Resume Session")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                        Text(
-                            session.isComplete
-                                ? "\(session.playlistName) · ready to save"
-                                : "\(session.playlistName) · \(session.decisions.count) of \(session.allSongs.count) swiped"
-                        )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(14)
-                .background(Color(.secondarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 14))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14)
-                        .stroke(Color.orange.opacity(0.3), lineWidth: 1)
-                )
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.top, 8)
-            .navigationDestination(isPresented: $showResume) {
-                if let songs = resumeSongs, let session = resumeSession {
-                    RetuneSwipeView(
-                        songs:        songs,
+            HStack(spacing: 4) {
+                Button {
+                    resumeTarget = ResumeTarget(
+                        songs:        session.allSongs,
                         playlistID:   session.playlistID,
                         playlistName: session.playlistName,
                         orderMode:    session.orderMode
                     )
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "arrow.counterclockwise.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(session.isComplete ? "Save Completed Session" : "Resume Session")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            Text(
+                                session.isComplete
+                                    ? "\(session.playlistName) · ready to save"
+                                    : "\(session.playlistName) · \(session.decisions.count) of \(session.allSongs.count) swiped"
+                            )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 4)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.leading, 14)
+                    .padding(.vertical, 14)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+
+                Button {
+                    sessionPendingDelete = PendingSessionDelete(
+                        session: session,
+                        playlistName: session.playlistName
+                    )
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.body)
+                        .foregroundStyle(.red)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 6)
+                .accessibilityLabel("Delete session for \(session.playlistName)")
             }
+            .background(Color(.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+            )
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
         }
     }
 
@@ -423,6 +498,21 @@ struct HomeView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
+
+// MARK: - Session navigation values
+
+// Plain values, so a destination never reads a SessionRecord after it's deleted.
+struct ResumeTarget: Hashable {
+    let songs: [Song]
+    let playlistID: String
+    let playlistName: String
+    let orderMode: String
+}
+
+private struct PendingSessionDelete {
+    let session: SessionRecord
+    let playlistName: String
 }
 
 // MARK: - Unified Playlist Row
@@ -501,14 +591,24 @@ struct UnifiedPlaylistRow: View {
         guard let url = selection.artworkURL else { return }
         if let cached = ImageCache.shared.image(for: url) {
             artworkImage = cached
-            if let avg = cached.averageColor { tintColor = Color(uiColor: avg) }
+            if let avg = await cached.averageColorInBackground { tintColor = Color(uiColor: avg) }
             return
         }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              let img = UIImage(data: data) else { return }
+        let data: Data
+        do {
+            // The default 60-second wait hides a stalled connection.
+            (data, _) = try await URLSession.shared.data(for: URLRequest(url: url, timeoutInterval: 15))
+        } catch {
+            if !Task.isCancelled {
+                NSLog("[Retune] Artwork failed for \"%@\" (%@): %@",
+                      selection.name, url.scheme ?? "no scheme", error.localizedDescription)
+            }
+            return
+        }
+        guard let img = UIImage(data: data) else { return }
         ImageCache.shared.set(img, for: url)
         artworkImage = img
-        if let avg = img.averageColor { tintColor = Color(uiColor: avg) }
+        if let avg = await img.averageColorInBackground { tintColor = Color(uiColor: avg) }
     }
 }
 
@@ -520,18 +620,18 @@ struct PlaylistSelection: Identifiable, Hashable {
     let artworkURL: URL?
     let isSpotify: Bool
     let lastPlayedDate: Date?
-    let trackCount: Int
+    var trackCount: Int
 
     var appleMusicPlaylist: Playlist?
     var spotifyPlaylist:    SpotifyPlaylist?
 
-    init(appleMusicPlaylist: Playlist) {
+    init(appleMusicPlaylist: Playlist, trackCount: Int = 0) {
         self.id                 = appleMusicPlaylist.id.rawValue
         self.name               = appleMusicPlaylist.name
         self.artworkURL         = appleMusicPlaylist.artwork?.url(width: 120, height: 120)
         self.isSpotify          = false
         self.lastPlayedDate     = appleMusicPlaylist.lastPlayedDate
-        self.trackCount         = appleMusicPlaylist.tracks?.count ?? 0
+        self.trackCount         = trackCount
         self.appleMusicPlaylist = appleMusicPlaylist
         self.spotifyPlaylist    = nil
     }
@@ -547,7 +647,10 @@ struct PlaylistSelection: Identifiable, Hashable {
         self.appleMusicPlaylist = nil
     }
 
-    static func == (lhs: PlaylistSelection, rhs: PlaylistSelection) -> Bool { lhs.id == rhs.id }
+    // Includes trackCount so SwiftUI redraws a row when its count arrives.
+    static func == (lhs: PlaylistSelection, rhs: PlaylistSelection) -> Bool {
+        lhs.id == rhs.id && lhs.trackCount == rhs.trackCount
+    }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
@@ -714,14 +817,14 @@ struct SpotifySessionSetupView: View {
         guard let url = playlist.artworkURL else { return }
         if let cached = ImageCache.shared.image(for: url) {
             artworkImage = cached
-            if let avg = cached.averageColor { tintColor = Color(uiColor: avg) }
+            if let avg = await cached.averageColorInBackground { tintColor = Color(uiColor: avg) }
             return
         }
         guard let (data, _) = try? await URLSession.shared.data(from: url),
               let img = UIImage(data: data) else { return }
         ImageCache.shared.set(img, for: url)
         artworkImage = img
-        if let avg = img.averageColor { tintColor = Color(uiColor: avg) }
+        if let avg = await img.averageColorInBackground { tintColor = Color(uiColor: avg) }
     }
 }
 
