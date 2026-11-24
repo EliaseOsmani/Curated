@@ -43,6 +43,25 @@ final class AppStateManager: ObservableObject {
     /// currently showing. Defaults to Apple Music. Toggled by the picker.
     @Published var activeService: MusicPlatform = .appleMusic
 
+    /// Incremented to pop every screen back to Home.
+    @Published private(set) var returnHomeRequest = 0
+    /// A playlist just saved to Apple Music that hasn't reached the device yet.
+    @Published private(set) var pendingSyncPlaylist: PendingSyncPlaylist?
+
+    struct PendingSyncPlaylist: Equatable {
+        let id: String
+        let name: String
+        let savedAt = Date()
+    }
+
+    func returnHome() {
+        returnHomeRequest += 1
+    }
+
+    func playlistSaved(id: String, name: String) {
+        pendingSyncPlaylist = PendingSyncPlaylist(id: id, name: name)
+    }
+
     // MARK: - Private
 
     private let onboardingKey = "hasCompletedOnboarding"
@@ -57,6 +76,7 @@ final class AppStateManager: ObservableObject {
     // MARK: - Boot sequence (called from LaunchScreenView)
 
     func boot() async {
+        NSLog("[Retune] Boot started (onboarded: %d)", hasCompletedOnboarding ? 1 : 0)
         // Route from Retune's local connection state instead of making launch
         // wait for MusicKit to resolve the device's Apple Music account. The
         // playlist request performs the authoritative permission check.

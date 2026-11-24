@@ -15,8 +15,12 @@ enum SaveState: Equatable {
     case lookingUpTracks
     case creatingPlaylist
     case addingTracks(current: Int, total: Int)
+    /// Reading Apple Music's copy back to confirm every song stuck.
+    case verifying
     case success(playlistName: String)
-    case partialSuccess(playlistName: String, added: Int, total: Int)
+    case partialSuccess(playlistName: String, added: Int, total: Int, missed: [MissedSong])
+    /// No kept song could be added.
+    case nothingSaved(missed: [MissedSong])
     case noSubscription
     case notAuthorized
     case failed(String)
@@ -28,18 +32,20 @@ enum SaveState: Equatable {
 final class SavePlaylistVM: ObservableObject {
     @Published var saveState: SaveState = .idle
 
-    /// Created by a failed attempt that added no songs. MusicKit can't delete
+    /// Created by an attempt that added no songs. The API can't delete
     /// playlists, so a retry fills this one instead of leaving an empty copy.
-    @Published private(set) var emptyPlaylist: Playlist?
+    @Published private(set) var retryPlaylistID: String?
 
     var isWorking: Bool {
         switch saveState {
-        case .idle, .success, .partialSuccess, .noSubscription, .notAuthorized, .failed: return false
+        case .idle, .success, .partialSuccess, .nothingSaved, .noSubscription, .notAuthorized, .failed: return false
         default: return true
         }
     }
 
-    func saveToAppleMusic(name: String, keptSongs: [Song]) async {
+    /// `sourcePlaylistID` is the playlist the session came from. Its tracks
+    /// name the catalog version of songs that aren't in the library.
+    func saveToAppleMusic(name: String, keptSongs: [Song], sourcePlaylistID: String? = nil) async {
         guard !isWorking else { return }
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !keptSongs.isEmpty else {
@@ -60,70 +66,95 @@ final class SavePlaylistVM: ObservableObject {
         }
 
         saveState = .lookingUpTracks
-        guard keptSongs.contains(where: { $0.musicItemID != nil }) else {
-            saveState = .failed("None of the kept songs have Apple Music IDs.")
-            return
+        let resolutions = await AppleMusicSaveResolver.resolve(keptSongs, sourcePlaylistID: sourcePlaylistID)
+
+        var toAdd: [(song: Song, track: AppleMusicLibraryAPI.Track)] = []
+        var missed: [MissedSong] = []
+        for song in keptSongs {
+            switch resolutions[AppleMusicSaveResolver.key(for: song)] {
+            case .add(let track)?: toAdd.append((song, track))
+            case .missing(let reason)?: missed.append(MissedSong(song: song, reason: reason))
+            case nil: missed.append(MissedSong(song: song, reason: .lookupFailed))
+            }
         }
 
-        let resolvedItems: [any MusicPlaylistAddable]
-        do {
-            resolvedItems = try await resolveItems(for: keptSongs)
-        } catch {
-            saveState = handleMusicKitError(error, fallback: "Couldn't look up songs in Apple Music.")
-            return
-        }
-
-        guard !resolvedItems.isEmpty else {
-            saveState = .failed("Couldn't find any of the kept songs in Apple Music.")
+        guard !toAdd.isEmpty else {
+            saveState = .nothingSaved(missed: missed)
             return
         }
 
         saveState = .creatingPlaylist
-        let destination: Playlist
-        if let emptyPlaylist {
-            destination = emptyPlaylist
+        let playlistID: String
+        if let retryPlaylistID {
+            playlistID = retryPlaylistID
         } else {
             do {
-                destination = try await MusicLibrary.shared.createPlaylist(
+                playlistID = try await AppleMusicLibraryAPI.createPlaylist(
                     name: name,
-                    description: "Curated with Retune on \(Date().formatted(date: .abbreviated, time: .omitted))",
-                    authorDisplayName: nil
+                    description: "Curated with Retune on \(Date().formatted(date: .abbreviated, time: .omitted))"
                 )
-                emptyPlaylist = destination
+                retryPlaylistID = playlistID
+                NSLog("[Retune] Save: created playlist %@", playlistID)
             } catch {
-                saveState = handleMusicKitError(error, fallback: "Couldn't create playlist in Apple Music.")
+                saveState = Self.state(for: AppleMusicLibraryAPI.classify(error))
                 return
             }
         }
 
+        // Batches keep the request count low. If one is refused, its songs
+        // are retried one by one so a single bad song doesn't sink the rest.
         var addedCount = 0
-        var firstAddError: Error?
-        for (index, item) in resolvedItems.enumerated() {
-            saveState = .addingTracks(current: index + 1, total: resolvedItems.count)
+        var processed = 0
+        for batch in toAdd.chunked(into: 100) {
+            saveState = .addingTracks(current: processed, total: toAdd.count)
             do {
-                try await MusicLibrary.shared.add(item, to: destination)
-                addedCount += 1
+                try await AppleMusicLibraryAPI.add(batch.map(\.track), to: playlistID)
+                addedCount += batch.count
             } catch {
-                firstAddError = firstAddError ?? error
-                print("[Retune] Couldn't add track \(index + 1): \(error)")
+                if case .transient = AppleMusicLibraryAPI.classify(error) {
+                    missed += batch.map { MissedSong(song: $0.song, reason: .addFailed) }
+                } else {
+                    for entry in batch {
+                        do {
+                            try await AppleMusicLibraryAPI.add([entry.track], to: playlistID)
+                            addedCount += 1
+                        } catch {
+                            missed.append(MissedSong(song: entry.song, reason: Self.reason(for: error, track: entry.track)))
+                        }
+                    }
+                }
+            }
+            processed += batch.count
+        }
+        saveState = .addingTracks(current: processed, total: toAdd.count)
+        if addedCount > 0 {
+            retryPlaylistID = nil
+            AppStateManager.shared.playlistSaved(id: playlistID, name: name)
+        }
+        NSLog("[Retune] Save: added %d of %d kept songs", addedCount, keptSongs.count)
+
+        // Check Apple Music's own copy of the playlist, so a song that was
+        // accepted but not stored is reported instead of counted as saved.
+        if addedCount > 0 {
+            saveState = .verifying
+            let added = toAdd.filter { entry in !missed.contains { $0.song.id == entry.song.id } }
+            let dropped = await Self.confirmSaved(added, playlistID: playlistID)
+            if !dropped.isEmpty {
+                missed += dropped
+                addedCount -= dropped.count
             }
         }
-        if addedCount > 0 { emptyPlaylist = nil }
 
-        let expectedCount = keptSongs.count
-        if addedCount == expectedCount {
+        // Same order as the review list.
+        let order = Dictionary(keptSongs.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        missed.sort { (order[$0.song.id] ?? 0) < (order[$1.song.id] ?? 0) }
+
+        if addedCount == keptSongs.count {
             saveState = .success(playlistName: name)
         } else if addedCount == 0 {
-            if let firstAddError {
-                saveState = handleMusicKitError(
-                    firstAddError,
-                    fallback: "Playlist was created but no songs could be added. Try again."
-                )
-            } else {
-                saveState = .failed("Playlist was created but no songs could be added. Try again.")
-            }
+            saveState = .nothingSaved(missed: missed)
         } else {
-            saveState = .partialSuccess(playlistName: name, added: addedCount, total: expectedCount)
+            saveState = .partialSuccess(playlistName: name, added: addedCount, total: keptSongs.count, missed: missed)
         }
     }
 
@@ -145,76 +176,132 @@ final class SavePlaylistVM: ObservableObject {
         }
     }
 
-    /// Songs from a library playlist carry library IDs ("i.…"), which the
-    /// catalog doesn't recognize. Resolve each ID from the right source and
-    /// return the items in the original order, keeping repeated tracks.
-    private func resolveItems(for songs: [Song]) async throws -> [any MusicPlaylistAddable] {
-        let videoIDs = songs.filter { $0.isMusicVideo == true }.compactMap(\.musicItemID).map { MusicItemID($0) }
-        let songIDs = songs.filter { $0.isMusicVideo != true }.compactMap(\.musicItemID).map { MusicItemID($0) }
+    /// Returns the songs still missing from Apple Music's copy of the
+    /// playlist after waiting and retrying, with the reason for each.
+    ///
+    /// Apple's servers can take a few seconds to show a song that was just
+    /// added, so the playlist is read again over about 12 seconds first.
+    /// A song still missing after that was refused. Apple can silently drop a
+    /// track and then reject it outright on a re-add, so the retry uses the
+    /// song's catalog version, and only falls back to the original track.
+    private static func confirmSaved(
+        _ entries: [(song: Song, track: AppleMusicLibraryAPI.Track)],
+        playlistID: String
+    ) async -> [MissedSong] {
+        let songs = entries.map(\.song)
+        guard var missing = await songsMissingOnServer(playlistID: playlistID, expected: songs) else { return [] }
 
-        var itemsByID: [MusicItemID: any MusicPlaylistAddable] = [:]
-        for song in try await fetchSongs(ids: songIDs) { itemsByID[song.id] = song }
-        for video in try await fetchMusicVideos(ids: videoIDs) { itemsByID[video.id] = video }
+        for delay in [2, 4, 6] where !missing.isEmpty {
+            try? await Task.sleep(for: .seconds(delay))
+            guard let recheck = await songsMissingOnServer(playlistID: playlistID, expected: songs) else { return [] }
+            missing = recheck
+        }
+        guard !missing.isEmpty else { return [] }
 
-        return songs.compactMap { song in
-            song.musicItemID.flatMap { itemsByID[MusicItemID($0)] }
+        let missingIDs = Set(missing.map(\.id))
+        let retries = entries.filter { missingIDs.contains($0.song.id) }
+        var stillMissing: [MissedSong] = []
+
+        for entry in retries {
+            NSLog("[Retune] Save: \"%@\" (%@ %@) wasn't kept; retrying",
+                  entry.song.title, entry.track.type, entry.track.id)
+            var candidates: [AppleMusicLibraryAPI.Track] = []
+            if let alternate = await AppleMusicSaveResolver.alternateTrack(for: entry.song, excluding: entry.track) {
+                candidates.append(alternate)
+            }
+            candidates.append(entry.track)
+
+            var added = false
+            for track in candidates {
+                do {
+                    try await AppleMusicLibraryAPI.add([track], to: playlistID)
+                    NSLog("[Retune] Save: re-added \"%@\" as %@ %@", entry.song.title, track.type, track.id)
+                    added = true
+                    break
+                } catch {
+                    NSLog("[Retune] Save: re-add as %@ %@ failed: %@", track.type, track.id, String(describing: error))
+                }
+            }
+            if !added {
+                stillMissing.append(MissedSong(
+                    song: entry.song,
+                    reason: entry.track.isLibraryOnly && candidates.count == 1 ? .libraryOnlyRejected : .notKept
+                ))
+            }
+        }
+
+        // Only the retried songs can have changed, so recheck just those.
+        let addedBack = retries.map(\.song).filter { song in !stillMissing.contains { $0.song.id == song.id } }
+        guard !addedBack.isEmpty else { return stillMissing }
+        try? await Task.sleep(for: .seconds(3))
+        if let after = await songsMissingOnServer(playlistID: playlistID, expected: songs) {
+            let afterIDs = Set(after.map(\.id))
+            for song in addedBack where afterIDs.contains(song.id) {
+                stillMissing.append(MissedSong(song: song, reason: .notKept))
+            }
+        }
+        return stillMissing
+    }
+
+    /// Expected songs missing from Apple Music's copy of the playlist, or nil
+    /// if it couldn't be read. Song IDs differ in the library, so songs are
+    /// matched by title and artist, counting repeats.
+    private static func songsMissingOnServer(playlistID: String, expected: [Song]) async -> [Song]? {
+        do {
+            let names = try await AppleMusicLibraryAPI.trackNames(in: playlistID)
+            NSLog("[Retune] Save: Apple Music's copy of the playlist has %d of %d added songs", names.count, expected.count)
+            guard names.count < expected.count else { return [] }
+
+            func key(_ title: String, _ artist: String) -> String {
+                "\(title)|\(artist)".folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            }
+            var remaining: [String: Int] = [:]
+            for name in names { remaining[key(name.title, name.artist), default: 0] += 1 }
+
+            var missing: [Song] = []
+            for song in expected {
+                let songKey = key(song.title, song.artist)
+                if let count = remaining[songKey], count > 0 {
+                    remaining[songKey] = count - 1
+                } else {
+                    missing.append(song)
+                }
+            }
+            // Titles can differ between the library and the catalog. Never
+            // report more songs missing than the count shows.
+            return Array(missing.prefix(expected.count - names.count))
+        } catch {
+            NSLog("[Retune] Save: couldn't read Apple Music's copy of the playlist: %@", String(describing: error))
+            return nil
         }
     }
 
-    private func fetchSongs(ids: [MusicItemID]) async throws -> [MusicKit.Song] {
-        let uniqueIDs = Array(Set(ids))
-        let libraryIDs = uniqueIDs.filter { $0.rawValue.hasPrefix("i.") }
-        let catalogIDs = uniqueIDs.filter { !$0.rawValue.hasPrefix("i.") }
-        let batchSize = 25
-        var results: [MusicKit.Song] = []
-
-        for batchStart in stride(from: 0, to: libraryIDs.count, by: batchSize) {
-            let batch = Array(libraryIDs[batchStart..<min(batchStart + batchSize, libraryIDs.count)])
-            var request = MusicLibraryRequest<MusicKit.Song>()
-            request.filter(matching: \.id, memberOf: batch)
-            request.limit = batchSize
-            results.append(contentsOf: try await request.response().items)
-        }
-
-        for batchStart in stride(from: 0, to: catalogIDs.count, by: batchSize) {
-            let batch = Array(catalogIDs[batchStart..<min(batchStart + batchSize, catalogIDs.count)])
-            var request = MusicCatalogResourceRequest<MusicKit.Song>(matching: \.id, memberOf: batch)
-            request.limit = batchSize
-            results.append(contentsOf: try await request.response().items)
-        }
-        return results
-    }
-
-    private func fetchMusicVideos(ids: [MusicItemID]) async throws -> [MusicVideo] {
-        let uniqueIDs = Array(Set(ids))
-        let libraryIDs = uniqueIDs.filter { $0.rawValue.hasPrefix("i.") }
-        let catalogIDs = uniqueIDs.filter { !$0.rawValue.hasPrefix("i.") }
-        let batchSize = 25
-        var results: [MusicVideo] = []
-
-        for batchStart in stride(from: 0, to: libraryIDs.count, by: batchSize) {
-            let batch = Array(libraryIDs[batchStart..<min(batchStart + batchSize, libraryIDs.count)])
-            var request = MusicLibraryRequest<MusicVideo>()
-            request.filter(matching: \.id, memberOf: batch)
-            request.limit = batchSize
-            results.append(contentsOf: try await request.response().items)
-        }
-
-        for batchStart in stride(from: 0, to: catalogIDs.count, by: batchSize) {
-            let batch = Array(catalogIDs[batchStart..<min(batchStart + batchSize, catalogIDs.count)])
-            var request = MusicCatalogResourceRequest<MusicVideo>(matching: \.id, memberOf: batch)
-            request.limit = batchSize
-            results.append(contentsOf: try await request.response().items)
-        }
-        return results
-    }
-
-    private func handleMusicKitError(_ error: Error, fallback: String) -> SaveState {
-        let nsError = error as NSError
-        if nsError.domain == "MPErrorDomain" && nsError.code == 5 {
+    private static func state(for failure: AppleMusicLibraryAPI.Failure) -> SaveState {
+        switch failure {
+        case .transient:
+            return .failed("Apple Music didn't respond. Check your connection and try again.")
+        case .notAuthorized:
+            return .notAuthorized
+        case .noSubscription:
             return .noSubscription
+        case .account(let message):
+            return .failed(message)
+        case .rejected(let detail):
+            let base = "Apple Music couldn't create the playlist."
+            guard let detail, !detail.isEmpty else { return .failed(base) }
+            return .failed("\(base) (\(detail))")
         }
-        return .failed(nsError.localizedDescription.isEmpty ? fallback : nsError.localizedDescription)
+    }
+
+    private static func reason(for error: Error, track: AppleMusicLibraryAPI.Track) -> MissedSong.Reason {
+        switch AppleMusicLibraryAPI.classify(error) {
+        case .transient:
+            return .addFailed
+        case .rejected(let detail):
+            return track.isLibraryOnly ? .libraryOnlyRejected : .rejected(detail: detail)
+        case .notAuthorized, .noSubscription, .account:
+            return track.isLibraryOnly ? .libraryOnlyRejected : .rejected(detail: nil)
+        }
     }
 }
 
@@ -227,6 +314,7 @@ struct SaveRetunedPlaylistView: View {
     let onSaveSucceeded: () -> Void
     let onReviewChanged: ([Song], [Song]) -> Void
     let originalSongs: [Song]
+    let sourcePlaylistID: String?
 
     @StateObject private var vm = SavePlaylistVM()
     @State private var newName = ""
@@ -240,6 +328,7 @@ struct SaveRetunedPlaylistView: View {
         removedSongs: [Song],
         platform: String,
         originalSongs: [Song]? = nil,
+        sourcePlaylistID: String? = nil,
         onSaveSucceeded: @escaping () -> Void = {},
         onReviewChanged: @escaping ([Song], [Song]) -> Void = { _, _ in }
     ) {
@@ -247,6 +336,7 @@ struct SaveRetunedPlaylistView: View {
         self.removedSongs = removedSongs
         self.platform = platform
         self.originalSongs = originalSongs ?? (keptSongs + removedSongs)
+        self.sourcePlaylistID = sourcePlaylistID
         self.onSaveSucceeded = onSaveSucceeded
         self.onReviewChanged = onReviewChanged
         _reviewedKeptSongs = State(initialValue: keptSongs)
@@ -287,9 +377,21 @@ struct SaveRetunedPlaylistView: View {
                 }
             }
 
+            if !missedSongs.isEmpty {
+                Section {
+                    ForEach(missedSongs) { missedSongRow($0) }
+                } header: {
+                    Text("Not Saved · \(missedSongs.count)")
+                }
+            }
+
             if !vm.isWorking {
                 Section {
-                    Button("Back to Summary") { dismiss() }
+                    if isFinalState {
+                        Button("Back to Home") { AppStateManager.shared.returnHome() }
+                    } else {
+                        Button("Back to Summary") { dismiss() }
+                    }
                 }
             }
         }
@@ -313,7 +415,7 @@ struct SaveRetunedPlaylistView: View {
                 TextField("Playlist name", text: $newName)
                     .textFieldStyle(.roundedBorder)
                     // A retry fills the playlist already created under this name.
-                    .disabled(vm.isWorking || vm.emptyPlaylist != nil)
+                    .disabled(vm.isWorking || vm.retryPlaylistID != nil)
                     .accessibilityLabel("New playlist name")
             }
 
@@ -335,7 +437,11 @@ struct SaveRetunedPlaylistView: View {
                     if platform == "spotify" {
                         await vm.saveToSpotify(name: newName, keptSongs: reviewedKeptSongs)
                     } else {
-                        await vm.saveToAppleMusic(name: newName, keptSongs: reviewedKeptSongs)
+                        await vm.saveToAppleMusic(
+                            name: newName,
+                            keptSongs: reviewedKeptSongs,
+                            sourcePlaylistID: sourcePlaylistID
+                        )
                     }
                     if case .success = vm.saveState {
                         onSaveSucceeded()
@@ -362,6 +468,9 @@ struct SaveRetunedPlaylistView: View {
         case .creatingPlaylist:
             progressRow(label: "Creating playlist…", icon: "plus.circle")
 
+        case .verifying:
+            progressRow(label: "Checking the saved playlist…", icon: "checkmark.circle")
+
         case .addingTracks(let current, let total):
             VStack(alignment: .leading, spacing: 8) {
                 progressRow(label: "Adding tracks (\(current) of \(total))…", icon: "music.note.list")
@@ -380,16 +489,19 @@ struct SaveRetunedPlaylistView: View {
                     Text("\"\(name)\" · \(reviewedKeptSongs.count) songs")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Text("Songs can take a minute to appear on this device while Apple Music syncs.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.vertical, 4)
 
-        case .partialSuccess(let name, let added, let total):
+        case .partialSuccess(let name, let added, let total, let missed):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Partially saved", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.body.weight(.medium))
-                Text("\"\(name)\" was created, but only \(added) of \(total) songs were added. Your Retune session has been kept so you can review it.")
+                Text("\"\(name)\" was created with \(added) of \(total) songs. \(missed.count == 1 ? "1 song couldn't" : "\(missed.count) songs couldn't") be added. See below for why. Your Retune session has been kept so you can review it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Retry by creating another playlist") { vm.saveState = .idle }
@@ -420,6 +532,21 @@ struct SaveRetunedPlaylistView: View {
             }
             .padding(.vertical, 4)
 
+        case .nothingSaved(let missed):
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Nothing saved", systemImage: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .font(.body.weight(.medium))
+                Text(missed.count == 1
+                     ? "The kept song couldn't be added. See below for why."
+                     : "None of the \(missed.count) kept songs could be added. See below for why.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Try Again") { vm.saveState = .idle }
+                    .font(.caption)
+            }
+            .padding(.vertical, 4)
+
         case .failed(let msg):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Save failed", systemImage: "xmark.circle.fill")
@@ -440,6 +567,30 @@ struct SaveRetunedPlaylistView: View {
         case .success, .partialSuccess, .noSubscription: return true
         default: return false
         }
+    }
+
+    private var missedSongs: [MissedSong] {
+        switch vm.saveState {
+        case .partialSuccess(_, _, _, let missed), .nothingSaved(let missed): return missed
+        default: return []
+        }
+    }
+
+    private func missedSongRow(_ missed: MissedSong) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(missed.song.title)
+                .font(.body)
+                .lineLimit(1)
+            Text(missed.song.artist)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text(missed.explanation)
+                .font(.caption)
+                .foregroundStyle(missed.isRetryable ? Color.orange : Color.secondary)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
     }
 
     private func progressRow(label: String, icon: String) -> some View {

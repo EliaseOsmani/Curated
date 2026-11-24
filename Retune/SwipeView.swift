@@ -123,6 +123,7 @@ struct RetuneSwipeView: View {
                 removedSongs: removedSongs,
                 platform: playlistID.hasPrefix("spotify:") ? "spotify" : "appleMusic",
                 originalSongs: allSongs,
+                sourcePlaylistID: playlistID,
                 onSaveSucceeded: completeSavedSession,
                 onReviewChanged: applyReviewedSongs
             )

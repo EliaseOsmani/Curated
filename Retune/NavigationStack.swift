@@ -198,6 +198,7 @@ struct HomeView: View {
         .navigationTitle("Retune")
         .navigationBarTitleDisplayMode(.large)
         .task {
+            NSLog("[Retune] Home appeared")
             appleMusicVM.setSortOption(playlistSortOption)
             // Let the onboarding-to-Home transition render before MusicKit
             // begins its first library/account request.
@@ -213,6 +214,13 @@ struct HomeView: View {
         }
         .onChange(of: resumeTarget) { _, newValue in
             appleMusicVM.setCountingPaused(newValue != nil || selected != nil)
+        }
+        .onChange(of: appState.returnHomeRequest) { _, _ in
+            selected = nil
+            resumeTarget = nil
+        }
+        .onChange(of: appState.pendingSyncPlaylist) { _, pending in
+            if let pending { appleMusicVM.watchForSync(id: pending.id, name: pending.name) }
         }
         .onChange(of: appState.connectedService) { _, _ in
             Task { await loadAll() }
@@ -586,8 +594,18 @@ struct UnifiedPlaylistRow: View {
             if let avg = await cached.averageColorInBackground { tintColor = Color(uiColor: avg) }
             return
         }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              let img = UIImage(data: data) else { return }
+        let data: Data
+        do {
+            // The default 60-second wait hides a stalled connection.
+            (data, _) = try await URLSession.shared.data(for: URLRequest(url: url, timeoutInterval: 15))
+        } catch {
+            if !Task.isCancelled {
+                NSLog("[Retune] Artwork failed for \"%@\" (%@): %@",
+                      selection.name, url.scheme ?? "no scheme", error.localizedDescription)
+            }
+            return
+        }
+        guard let img = UIImage(data: data) else { return }
         ImageCache.shared.set(img, for: url)
         artworkImage = img
         if let avg = await img.averageColorInBackground { tintColor = Color(uiColor: avg) }

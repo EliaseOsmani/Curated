@@ -16,8 +16,10 @@ final class AudioPreviewPlayer: ObservableObject {
     @Published private(set) var isMuted: Bool
 
     private let mutedKey = "previewAudioMuted"
-    private let fadeSteps = 8
-    private let fadeStepDuration: Duration = .milliseconds(18)
+    private let fadeInDuration: Double = 0.6
+    private let fadeOutDuration: Double = 0.4
+    /// About 60 volume updates a second, so the ramp has no audible steps.
+    private let fadeStepDuration: Double = 1.0 / 60.0
 
     private var player: AVPlayer?
     /// The current card's clip. Kept while muted so unmuting can start it.
@@ -26,6 +28,9 @@ final class AudioPreviewPlayer: ObservableObject {
     private var resumeAfterInterruption = false
 
     private var playbackObserver: AnyCancellable?
+    /// Fires shortly before the clip ends so it fades out instead of cutting off.
+    private var endFadeObserver: (player: AVPlayer, token: Any)?
+    private var endFadeSetupTask: Task<Void, Never>?
     private var interruptionObserver: AnyCancellable?
     private var fadeInTask: Task<Void, Never>?
     private var deactivationTask: Task<Void, Never>?
@@ -93,17 +98,54 @@ final class AudioPreviewPlayer: ObservableObject {
                 self.fadeIn(newPlayer)
             }
 
+        scheduleEndFade(for: newPlayer)
         newPlayer.play()
+    }
+
+    /// Fades the clip out as it reaches its end.
+    private func scheduleEndFade(for target: AVPlayer) {
+        guard let asset = target.currentItem?.asset else { return }
+        let lead = fadeOutDuration
+        endFadeSetupTask = Task { [weak self] in
+            guard let duration = try? await asset.load(.duration),
+                  duration.isNumeric, duration.seconds > lead * 2,
+                  !Task.isCancelled,
+                  let self, self.player === target
+            else { return }
+
+            let fadeStart = CMTime(seconds: duration.seconds - lead, preferredTimescale: 600)
+            let token = target.addBoundaryTimeObserver(
+                forTimes: [NSValue(time: fadeStart)],
+                queue: .main
+            ) { [weak self, weak target] in
+                MainActor.assumeIsolated {
+                    guard let self, let target, self.player === target else { return }
+                    self.fadeInTask?.cancel()
+                    self.fadeInTask = self.ramp(target, to: 0, over: lead)
+                }
+            }
+            self.endFadeObserver = (target, token)
+        }
     }
 
     private func fadeIn(_ target: AVPlayer) {
         fadeInTask?.cancel()
-        let steps = fadeSteps
-        let stepDuration = fadeStepDuration
-        fadeInTask = Task {
+        fadeInTask = ramp(target, to: 1, over: fadeInDuration)
+    }
+
+    /// Moves volume to `targetVolume` along an ease-in-out curve, which sounds
+    /// smoother than a straight line.
+    @discardableResult
+    private func ramp(_ target: AVPlayer, to targetVolume: Float, over seconds: Double) -> Task<Void, Never> {
+        let startVolume = target.volume
+        let steps = max(1, Int((seconds / fadeStepDuration).rounded()))
+        let stepDuration = Duration.seconds(fadeStepDuration)
+        return Task {
             for step in 1...steps {
                 guard !Task.isCancelled else { return }
-                target.volume = Float(step) / Float(steps)
+                let t = Double(step) / Double(steps)
+                let eased = Float(t * t * (3 - 2 * t))
+                target.volume = startVolume + (targetVolume - startVolume) * eased
                 try? await Task.sleep(for: stepDuration)
             }
         }
@@ -113,19 +155,20 @@ final class AudioPreviewPlayer: ObservableObject {
         fadeInTask?.cancel()
         fadeInTask = nil
         playbackObserver = nil
+        endFadeSetupTask?.cancel()
+        endFadeSetupTask = nil
+        if let observer = endFadeObserver {
+            observer.player.removeTimeObserver(observer.token)
+            endFadeObserver = nil
+        }
         resumeAfterInterruption = false
 
         guard let outgoing = player else { return }
         player = nil
 
-        let startVolume = outgoing.volume
-        let steps = fadeSteps
-        let stepDuration = fadeStepDuration
+        let fade = ramp(outgoing, to: 0, over: fadeOutDuration)
         Task {
-            for step in 1...steps {
-                outgoing.volume = startVolume * (1 - Float(step) / Float(steps))
-                try? await Task.sleep(for: stepDuration)
-            }
+            await fade.value
             outgoing.pause()
         }
     }
@@ -152,15 +195,18 @@ final class AudioPreviewPlayer: ObservableObject {
         deactivationTask?.cancel()
         deactivationTask = Task { [weak self] in
             // Wait for the outgoing clip to finish fading.
-            try? await Task.sleep(for: .milliseconds(220))
+            try? await Task.sleep(for: .seconds(self?.fadeOutDuration ?? 0.4) + .milliseconds(80))
             guard !Task.isCancelled, let self, self.player == nil else { return }
-            do {
-                try AVAudioSession.sharedInstance()
-                    .setActive(false, options: .notifyOthersOnDeactivation)
-            } catch {
-                print("[Retune] Couldn't release audio session: \(error)")
-            }
             self.isSessionActive = false
+            // Deactivating blocks while audio stops, so keep it off the main thread.
+            await Task.detached(priority: .userInitiated) {
+                do {
+                    try AVAudioSession.sharedInstance()
+                        .setActive(false, options: .notifyOthersOnDeactivation)
+                } catch {
+                    print("[Retune] Couldn't release audio session: \(error)")
+                }
+            }.value
         }
     }
 

@@ -8,7 +8,7 @@
 import Foundation
 import MusicKit
 
-struct Song: Identifiable, Codable, Hashable {
+nonisolated struct Song: Identifiable, Codable, Hashable {
     let id: UUID
     let title: String
     let artist: String
@@ -19,6 +19,8 @@ struct Song: Identifiable, Codable, Hashable {
     let isMusicVideo: Bool?
     /// Finds the matching catalog recording. Absent from older saved sessions.
     let isrc: String?
+    /// The Apple Music catalog ID for library songs. Absent from older sessions.
+    let catalogID: String?
 
     init(
         id: UUID = UUID(),
@@ -28,7 +30,8 @@ struct Song: Identifiable, Codable, Hashable {
         previewURL: URL? = nil,
         musicItemID: String? = nil,
         isMusicVideo: Bool = false,
-        isrc: String? = nil
+        isrc: String? = nil,
+        catalogID: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -38,5 +41,6 @@ struct Song: Identifiable, Codable, Hashable {
         self.musicItemID = musicItemID
         self.isMusicVideo = isMusicVideo
         self.isrc = isrc
+        self.catalogID = catalogID
     }
 }

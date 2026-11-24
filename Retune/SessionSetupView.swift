@@ -32,6 +32,10 @@ final class SessionSetupVM: ObservableObject {
     @Published var loadedSongCount = 0
     @Published var errorMessage: String?
     @Published private(set) var orderMode: SessionOrderMode = .inOrder
+    /// The device's copy is empty and Apple Music's server copy is being read.
+    @Published private(set) var isSyncing = false
+    /// Explains that the playlist hasn't fully reached this device yet.
+    @Published private(set) var syncNote: String?
 
     let playlist: Playlist
     private var hasLoaded = false
@@ -49,10 +53,18 @@ final class SessionSetupVM: ObservableObject {
         errorMessage = nil
         defer { isLoading = false }
 
+        NSLog("[Retune] Loading songs for \"%@\"", playlist.name)
         do {
-            let tracks = try await AppleMusicTracks.all(in: playlist) { [weak self] count in
+            let playlist = self.playlist
+            let progress: @MainActor @Sendable (Int) -> Void = { [weak self] count in
                 self?.loadedSongCount = count
             }
+            // MusicKit can stall when Apple's servers are unreachable. Without
+            // a limit the setup screen would spin forever.
+            let tracks = try await withMusicKitTimeout(seconds: 30) {
+                try await AppleMusicTracks.all(in: playlist, onProgress: progress)
+            }
+            NSLog("[Retune] Loaded %d tracks", tracks.count)
 
             songs = tracks.compactMap { track in
                 if case let .song(song) = track {
@@ -62,7 +74,8 @@ final class SessionSetupVM: ObservableObject {
                         artworkURL: song.artwork?.url(width: 600, height: 600),
                         previewURL: song.previewAssets?.first?.url,
                         musicItemID: song.id.rawValue,
-                        isrc: song.isrc
+                        isrc: song.isrc,
+                        catalogID: AppleMusicSaveResolver.catalogID(from: song.playParameters)
                     )
                 }
                 if case let .musicVideo(video) = track {
@@ -72,17 +85,41 @@ final class SessionSetupVM: ObservableObject {
                         artworkURL: video.artwork?.url(width: 600, height: 600),
                         previewURL: video.previewAssets?.first?.url,
                         musicItemID: video.id.rawValue,
-                        isMusicVideo: true
+                        isMusicVideo: true,
+                        catalogID: AppleMusicSaveResolver.catalogID(from: video.playParameters)
                     )
                 }
                 return nil
             }
+            if songs.isEmpty { await loadFromServer() }
             if orderMode == .shuffled { shuffledSongs = songs.shuffled() }
-            hasLoaded = true
+            hasLoaded = !songs.isEmpty || syncNote == nil
         } catch is CancellationError {
             return
         } catch {
+            NSLog("[Retune] Song load failed: %@", String(describing: error))
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// A playlist saved moments ago can reach the device without its songs.
+    /// Apple Music's server copy already has them, so read that instead of
+    /// waiting for the sync.
+    private func loadFromServer() async {
+        isSyncing = true
+        defer { isSyncing = false }
+        let playlistID = playlist.id.rawValue
+        do {
+            let tracks = try await withMusicKitTimeout(seconds: 30) {
+                try await AppleMusicLibraryAPI.serverTracks(in: playlistID)
+            }
+            NSLog("[Retune] Loaded %d tracks from Apple Music's server copy", tracks.count)
+            songs = tracks.map(\.song)
+            syncNote = songs.isEmpty ? nil
+                : "Loaded from Apple Music. This playlist is still syncing to your device."
+        } catch {
+            NSLog("[Retune] Server track load failed: %@", String(describing: error))
+            syncNote = "This playlist may still be syncing from Apple Music. Go back and open it again in a minute."
         }
     }
 
@@ -142,6 +179,12 @@ struct SessionSetupView: View {
                 VStack(spacing: 28) {
                     artworkHeader
                     songCountBadge
+                    if let note = vm.syncNote {
+                        Label(note, systemImage: "icloud.and.arrow.down")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                     orderPicker
                     songList
                 }
@@ -247,7 +290,8 @@ struct SessionSetupView: View {
             if vm.isLoading {
                 HStack(spacing: 6) {
                     ProgressView().scaleEffect(0.8)
-                    Text(vm.loadedSongCount > 0 ? "Loading songs… \(vm.loadedSongCount)" : "Loading songs…")
+                    Text(vm.isSyncing ? "Syncing from Apple Music…"
+                         : vm.loadedSongCount > 0 ? "Loading songs… \(vm.loadedSongCount)" : "Loading songs…")
                         .foregroundStyle(.secondary)
                 }
             } else if let err = vm.errorMessage {

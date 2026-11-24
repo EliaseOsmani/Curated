@@ -11,19 +11,63 @@ import MusicKit
 
 private enum PlaylistLoadError: LocalizedError {
     case timedOut
+    case notAuthorized
 
     var errorDescription: String? {
         switch self {
+        case .notAuthorized:
+            return "Apple Music access not authorized. Allow it in Settings → Apps → Retune, then try again."
         case .timedOut:
             return "Apple Music did not respond. Check Settings → Apple Account → Media & Purchases, then try again."
         }
     }
 }
 
+// MARK: - Timeout
+
+/// Thrown when Apple Music doesn't answer in time.
+nonisolated struct MusicKitTimeoutError: LocalizedError {
+    var errorDescription: String? {
+        "Apple Music didn't respond. Check your internet connection, then try again."
+    }
+}
+
+/// Runs a MusicKit call with a time limit. Both tasks are detached, so the
+/// timeout fires even if MusicKit stalls the thread it was called from.
+nonisolated func withMusicKitTimeout<T: Sendable>(
+    seconds: Double,
+    _ operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    let results = AsyncThrowingStream<T, Error> { continuation in
+        let work = Task.detached(priority: .userInitiated) {
+            do {
+                continuation.yield(try await operation())
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        let timeout = Task.detached {
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            continuation.finish(throwing: MusicKitTimeoutError())
+        }
+        continuation.onTermination = { _ in
+            work.cancel()
+            timeout.cancel()
+        }
+    }
+    for try await value in results { return value }
+    throw CancellationError()
+}
+
 // MARK: - Track paging
 
 nonisolated enum AppleMusicTracks {
     /// Fetches every track in a playlist, following MusicKit's batches.
+    /// `@concurrent` keeps MusicKit off the main thread, which approachable
+    /// concurrency would otherwise run this on.
+    @concurrent
     static func all(
         in playlist: Playlist,
         onProgress: (@MainActor @Sendable (Int) -> Void)? = nil
@@ -74,6 +118,7 @@ final class MusicPlaylistsVM: ObservableObject {
     private var pendingCounts: [String: Int] = [:]
     private var flushTask: Task<Void, Never>?
     private var isCountingPaused = false
+    private var syncWatchTask: Task<Void, Never>?
 
     init() {
         cachedCounts = UserDefaults.standard.dictionary(forKey: countsKey) as? [String: Int] ?? [:]
@@ -100,20 +145,7 @@ final class MusicPlaylistsVM: ObservableObject {
         isLoading = selections.isEmpty
         errorMessage = nil
 
-        // Connecting during onboarding already requested permission. Calling
-        // request() again here can make MusicKit resolve the Apple account a
-        // second time and block the transition into Home.
-        let currentStatus = MusicAuthorization.currentStatus
-        let status = currentStatus == .notDetermined
-            ? await MusicAuthorization.request()
-            : currentStatus
-        guard status == .authorized else {
-            guard loadID == currentLoadID else { return }
-            errorMessage = "Apple Music access not authorized."
-            isLoading = false
-            return
-        }
-
+        NSLog("[Retune] Starting Apple Music playlist load")
         do {
             let libraryPlaylists = try await fetchLibraryPlaylists()
             guard loadID == currentLoadID else { return }
@@ -137,18 +169,25 @@ final class MusicPlaylistsVM: ObservableObject {
     private func fetchLibraryPlaylists() async throws -> [Playlist] {
         // Not a task group: a group can't exit until every child finishes, so
         // a stalled MusicKit request would hold back the timeout error.
+        // Both tasks are detached so neither depends on the main thread. If
+        // MusicKit stalls it, the timeout still fires.
         let results = AsyncThrowingStream<[Playlist], Error> { continuation in
-            let fetch = Task {
+            let fetch = Task.detached(priority: .userInitiated) {
                 do {
-                    continuation.yield(try await Self.requestLibraryPlaylists())
+                    try await Self.checkAuthorization()
+                    let playlists = try await Self.requestLibraryPlaylists()
+                    NSLog("[Retune] Loaded %d library playlists", playlists.count)
+                    continuation.yield(playlists)
                     continuation.finish()
                 } catch {
+                    NSLog("[Retune] Library playlist request failed: %@", String(describing: error))
                     continuation.finish(throwing: error)
                 }
             }
-            let timeout = Task {
+            let timeout = Task.detached {
                 try? await Task.sleep(for: .seconds(15))
                 guard !Task.isCancelled else { return }
+                NSLog("[Retune] Library playlist request timed out")
                 continuation.finish(throwing: PlaylistLoadError.timedOut)
             }
             continuation.onTermination = { _ in
@@ -163,7 +202,20 @@ final class MusicPlaylistsVM: ObservableObject {
         throw CancellationError()
     }
 
+    /// Runs off the main thread: reading the status can block while MusicKit
+    /// resolves the Apple account. Onboarding already requested permission,
+    /// so request() is only called if the status is still undetermined.
+    @concurrent
+    private nonisolated static func checkAuthorization() async throws {
+        let current = MusicAuthorization.currentStatus
+        NSLog("[Retune] Apple Music authorization: %@", String(describing: current))
+        let status = current == .notDetermined ? await MusicAuthorization.request() : current
+        guard status == .authorized else { throw PlaylistLoadError.notAuthorized }
+    }
+
+    @concurrent
     private nonisolated static func requestLibraryPlaylists() async throws -> [Playlist] {
+        NSLog("[Retune] Requesting library playlists")
         var request = MusicLibraryRequest<Playlist>()
         request.limit = 50
         let response = try await request.response()
@@ -206,6 +258,32 @@ final class MusicPlaylistsVM: ObservableObject {
 
         selections = sortOption.sorted(rows)
         if sortOption.needsTrackCounts { requestAllTrackCounts() }
+    }
+
+    // MARK: - Sync after saving
+
+    /// Rechecks the library for a minute after a save, so the new playlist and
+    /// its song count appear without a manual refresh. The device's ID for the
+    /// playlist may differ from Apple Music's, so the name is checked too.
+    func watchForSync(id: String, name: String) {
+        syncWatchTask?.cancel()
+        syncWatchTask = Task { [weak self] in
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled, let self else { return }
+                await self.refresh()
+                let row = self.selections.first { $0.id == id }
+                    ?? self.selections.first { $0.name == name }
+                if let row {
+                    if row.trackCount > 0 {
+                        NSLog("[Retune] Saved playlist synced with %d songs", row.trackCount)
+                        return
+                    }
+                    self.requestTrackCount(for: row.id)
+                }
+            }
+            NSLog("[Retune] Stopped waiting for the saved playlist to sync")
+        }
     }
 
     // MARK: - Sorting
